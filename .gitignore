@@ -4,3 +4,7 @@
 lit/
 netseq-tasep/
 CLAUDE.md 
+.gitignore
+openspec/
+.windsurf/
+.codex/
