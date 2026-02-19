@@ -236,7 +236,7 @@ function output= NETSEQ_TASEP_function(input_parameters)
 		%   2. Draw independent Exp(specificDwelltime) for each base in the window.
 		%   3. cumsum() gives the cumulative time to reach each successive base.
 		%   4. Add the current time t to get absolute exit times.
-		%   5. Filter to keep only exits within [t, t+dt] — these are the bases
+		%   5. Filter to keep only exits within [t, t+dt]. These are the bases
 		%      the RNAP actually crosses during this time step.
 		%   6. The number of kept exits = how many bases the RNAP advances.
 		%
@@ -338,17 +338,17 @@ function output= NETSEQ_TASEP_function(input_parameters)
 			%   - If Ribo_locs is empty, initialize it first
 			%   - If Ribo_locs has fewer rows than the current RNAP index, expand it
 			%   - Otherwise, just set position and reset exit times
-			if(Riboloadt(rnap) <=t & rnap_locs(rnap) >=Ribo_width)
-				Riboloadt(rnap) = simtime;
-				if size(Ribo_locs)==0
+			if(Riboloadt(rnap) <=t & rnap_locs(rnap) >=Ribo_width) 
+				Riboloadt(rnap) = simtime; % Reset loading time to "never again"
+				if size(Ribo_locs)==0 % If Ribo_locs is empty, initialize it first
 					Ribo_locs(1)=0;
 					riboExitTimes(1,1) =0;
 					Ribo_locs(rnap) = 1;
 					riboExitTimes(1,rnap)= t;
-				elseif size(Ribo_locs,1) <rnap
+				elseif size(Ribo_locs,1) <rnap % If Ribo_locs has fewer rows than the current RNAP index, expand it
 					Ribo_locs(rnap)=1;
 					riboExitTimes(1,rnap) =t;
-				else
+				else % Otherwise, just set position and reset exit times
 					Ribo_locs(rnap)=1;
 					riboExitTimes(:,rnap) = zeros(geneLength,1);
 				end
