@@ -1,7 +1,9 @@
 # sjkimlab_NETSEQ_TASEP
 
-Original MATLAB code written by Albur Hassan, sjkimlab at University of Illinois at Urbana-Champaign.
+Original MATLAB TASEP code written by Albur Hassan at University of Illinois at Urbana-Champaign.
 Contact: ahassan4@illinois.edu
+
+Faster Python version with CPU multithreading and Numba JIT compilation written by Ron Acda (racda@illinois.edu)
 
 ## Overview
 
