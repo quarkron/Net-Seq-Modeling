@@ -1,6 +1,6 @@
 # sjkimlab_NETSEQ_TASEP
 
-Code written by Albur Hassan, sjkimlab at University of Illinois at Urbana-Champaign.
+Original MATLAB code written by Albur Hassan, sjkimlab at University of Illinois at Urbana-Champaign.
 Contact: ahassan4@illinois.edu
 
 ## Overview
