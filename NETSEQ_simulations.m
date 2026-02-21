@@ -68,3 +68,5 @@ NETseqSum = sum(temp_NETseq(:,200:200:1500),2);
 
 figure; hold on;
 plot(NETseqSum);
+
+

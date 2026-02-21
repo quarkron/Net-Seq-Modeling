@@ -389,7 +389,7 @@ function output= NETSEQ_TASEP_function(input_parameters)
 			if PT_Model==2 && rnap_locs(RNA)<geneLength
 				PTRNAsize = rnap_locs(RNA)- RNAP_width-rho_width;
 				PTRNAsize= PTRNAsize - Ribo_locs(RNA,1);
-				if PTRNAsize>minRholoadRNA && 100*dt*rand <= PTpercent*PTRNAsize/geneLength
+				if PTRNAsize>minRholoadRNA && 100*dt*rand <= PTpercent*PTRNAsize/geneLength %change this genelength to 3074
 					temp_rho_loading_loc = rnap_locs(RNA)- RNAP_width- floor(rand*PTRNAsize);
 					if temp_rho_loading_loc>rho_locs(RNA,1)
 						rho_locs(RNA,1)=temp_rho_loading_loc;
