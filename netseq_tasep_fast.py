@@ -72,8 +72,7 @@ from __future__ import annotations
 
 import math
 import os
-from concurrent.futures import ProcessPoolExecutor
-from concurrent.futures.process import BrokenProcessPool
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -106,18 +105,11 @@ HISTORY_CAP_BUFFER_ADD = 32
 HISTORY_CAP_MIN_GAP = 8
 
 
-# ── Process-pool executor cache ─────────────────────────────────────────────
-# Spawning worker processes is expensive (~1 s each).  We cache the executor
-# keyed by worker count and invalidate it only if gene parameters change.
-_EXECUTOR_CACHE: dict[int, ProcessPoolExecutor] = {}
-_EXECUTOR_TOKEN: dict[int, tuple[int, float, float, float, float]] = {}
-_WORKER_PARAMETERS: dict | None = None
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # _sample_first_passage
 # ══════════════════════════════════════════════════════════════════════════════
-@njit(cache=False)
+@njit(cache=True, nogil=True)
 def _sample_first_passage(
     dwell_profile: np.ndarray,
     start_pos: int,
@@ -186,7 +178,7 @@ def _sample_first_passage(
 # ══════════════════════════════════════════════════════════════════════════════
 # _tasep_core
 # ══════════════════════════════════════════════════════════════════════════════
-@njit(cache=False)
+@njit(cache=True, nogil=True)
 def _tasep_core(
     seed: int,
     active_cap: int,
@@ -1078,87 +1070,20 @@ def _load_gene_parameters(gene: str) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Worker functions for parallel execution
+# Worker function for parallel execution
 # ══════════════════════════════════════════════════════════════════════════════
 # MATLAB has no built-in equivalent: NETSEQ_simulations.m loops sequentially:
 #   for i = 1:nloci: output = sjkimlab_NETSEQ_TASEP(parameters); ...
 #
-# Python uses ProcessPoolExecutor to run simulations in parallel across CPU cores.
-# The "initializer" pattern (_init_worker_parameters / _worker_seed) avoids
-# pickling the full parameter dict (including the large dwell profile array) on
-# every task submission. It is sent once at process startup instead.
+# Python uses ThreadPoolExecutor to run simulations in parallel across CPU cores.
+# With nogil=True on the Numba kernels, threads achieve true parallelism without
+# needing process-based isolation or parameter pickling.
 
 def _worker(args: tuple[dict, int]) -> np.ndarray:
     """Single-run worker: run one simulation and return its NETseq_sum."""
     parameters, seed = args
     result = netseq_tasep_fast(parameters, seed=seed)
     return np.asarray(result["NETseq_sum"], dtype=float)
-
-
-def _parameters_token(parameters: dict) -> tuple[int, float, float, float, float]:
-    """
-    Compact fingerprint of the parameters dict used to detect when the executor
-    needs to be restarted (because the gene/parameters changed between calls).
-    """
-    dwell = np.asarray(parameters["RNAP_dwellTimeProfile"], dtype=float)
-    return (
-        int(dwell.size),
-        float(parameters.get("kRiboLoading", 0.0)),
-        float(parameters.get("KRutLoading", 0.0)),
-        float(np.sum(dwell)),
-        float(np.sum(dwell * dwell)),
-    )
-
-
-def _init_worker_parameters(parameters: dict) -> None:
-    """
-    Worker process initializer: store parameters in process-global state.
-    Called once per worker process at pool creation time.
-    Avoids re-pickling the large dwell profile array for every task.
-    """
-    global _WORKER_PARAMETERS
-    _WORKER_PARAMETERS = parameters
-
-
-def _worker_seed(seed: int) -> np.ndarray:
-    """Single-seed worker using process-global parameters (set by initializer)."""
-    if _WORKER_PARAMETERS is None:
-        raise ValueError("worker parameters are not initialized")
-    result = netseq_tasep_fast(_WORKER_PARAMETERS, seed=int(seed))
-    return np.asarray(result["NETseq_sum"], dtype=float)
-
-
-def _worker_seed_batch(seeds: list[int]) -> np.ndarray:
-    """
-    Batch worker: run multiple seeds sequentially within one worker process
-    and return their summed NETseq signal.  Reduces inter-process communication
-    overhead when n_runs >> n_workers.
-    """
-    netseq_total = None
-    for seed in seeds:
-        output = _worker_seed(int(seed))
-        if netseq_total is None:
-            netseq_total = output
-        else:
-            netseq_total += output
-    if netseq_total is None:
-        raise ValueError("worker seed batch received no seeds")
-    return netseq_total
-
-
-def _worker_batch(args: tuple[dict, list[int]]) -> np.ndarray:
-    """Batch worker that also receives parameters (alternative to initializer pattern)."""
-    parameters, seeds = args
-    netseq_total = None
-    for seed in seeds:
-        output = _worker((parameters, seed))
-        if netseq_total is None:
-            netseq_total = output
-        else:
-            netseq_total += output
-    if netseq_total is None:
-        raise ValueError("worker batch received no seeds")
-    return netseq_total
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1196,7 +1121,7 @@ def run_netseq_simulations_fast(
     n_runs    : number of independent simulation replicates to average
     seed      : base RNG seed; run i uses seed (base_seed + i).
                 If None, a random base seed is drawn.
-    n_workers : number of parallel worker processes.
+    n_workers : number of parallel worker threads.
                 Defaults to os.cpu_count().  Set to 1 to run serially.
 
     Returns
@@ -1224,44 +1149,12 @@ def run_netseq_simulations_fast(
         for output in outputs:
             netseq_total += output
     else:
-        # Parallel path: split seeds into n_batches chunks (one per worker).
-        # Each worker accumulates its chunk's sum; we add the chunk sums here.
-        # The executor is cached and reused across calls with the same parameters,
-        # avoiding repeated process spawn overhead.
-        n_batches = min(n_workers, n_runs)
-        seed_chunks = [chunk.tolist() for chunk in np.array_split(np.asarray(seeds), n_batches)]
-        worker_args = [chunk for chunk in seed_chunks if len(chunk) > 0]
-
-        params_token = _parameters_token(parameters)
-        executor = _EXECUTOR_CACHE.get(n_workers)
-        token = _EXECUTOR_TOKEN.get(n_workers)
-
-        # Restart executor if parameters changed (e.g., different gene).
-        if executor is None or token != params_token:
-            if executor is not None:
-                executor.shutdown(wait=True, cancel_futures=True)
-            executor = ProcessPoolExecutor(
-                max_workers=n_workers,
-                initializer=_init_worker_parameters,
-                initargs=(parameters,),
-            )
-            _EXECUTOR_CACHE[n_workers] = executor
-            _EXECUTOR_TOKEN[n_workers] = params_token
-
-        try:
-            outputs = list(executor.map(_worker_seed_batch, worker_args))
-        except BrokenProcessPool:
-            # Worker process crashed (e.g., segfault in Numba); restart and retry.
-            executor.shutdown(wait=True, cancel_futures=True)
-            executor = ProcessPoolExecutor(
-                max_workers=n_workers,
-                initializer=_init_worker_parameters,
-                initargs=(parameters,),
-            )
-            _EXECUTOR_CACHE[n_workers] = executor
-            _EXECUTOR_TOKEN[n_workers] = params_token
-            outputs = list(executor.map(_worker_seed_batch, worker_args))
-
+        # Parallel path: threads call netseq_tasep_fast directly with shared
+        # parameters.  Numba's nogil=True releases the GIL during the compiled
+        # _tasep_core kernel, enabling true multi-core parallelism.
+        worker_args = [(parameters, s) for s in seeds]
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            outputs = list(executor.map(_worker, worker_args))
         netseq_total = np.zeros_like(outputs[0], dtype=float)
         for output in outputs:
             netseq_total += output
