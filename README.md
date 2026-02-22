@@ -5,6 +5,19 @@ Contact: ahassan4@illinois.edu
 
 Faster Python version with CPU multithreading and Numba JIT compilation written by Ron Acda (racda@illinois.edu)
 
+## Installation
+To run the Jupyter notebooks, you will need to install the dependencies in `requirements.txt`.
+
+```bash
+# Create and activate virtual environment
+python -m venv netseq-tasep
+netseq-tasep\Scripts\activate      # Windows
+# source netseq-tasep/bin/activate  # Linux/Mac
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
 ## Overview
 
 This project simulates how RNAP traffic, ribosome coupling, and Rho-dependent premature termination shape the NET-seq (Nascent Elongating Transcript sequencing) signal along an *E. coli* gene. The simulation uses a TASEP (Totally Asymmetric Simple Exclusion Process) framework.

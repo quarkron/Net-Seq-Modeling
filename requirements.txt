@@ -1,0 +1,6 @@
+numpy>=2.0
+pandas>=2.0
+matplotlib>=3.9
+numba>=0.60
+cma>=4.0
+ipykernel>=6.0
