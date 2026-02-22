@@ -9,8 +9,8 @@ The MATLAB reference implementation (sjkimlab_NETSEQ_TASEP.m) is a straightforwa
 1-D stochastic simulation: arrays grow dynamically, the inner loop is interpreted
 MATLAB, and the NETseq output is a full (geneLength × simtime) matrix.
 
-This Python file preserves the exact same **biology and algorithm** but makes three
-engineering changes that together give ~10-50× speedups:
+This Python file preserves the exact same **biology and algorithm** but makes three 
+changes that together give ~10-50× speedups:
 
   1. Numba JIT (`@njit`)  — the entire inner loop is compiled to native machine code
      by Numba.  This removes Python interpreter overhead, which dominates for tight
