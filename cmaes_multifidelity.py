@@ -134,6 +134,7 @@ class CMAESConfig:
     early_stopping: EarlyStopping = field(default_factory=EarlyStopping)
     checkpoint_every: int = 25
     checkpoint_dir: str | None = None
+    display_every: int = 1
     use_gpu: bool = True
     device_id: int = 0
     stream: object = None
@@ -260,14 +261,27 @@ def run_cmaes_for_gene(
         history["n_runs"].append(n_runs)
         history["elapsed"].append(elapsed)
 
+        # Progress display
+        if config.display_every > 0 and gen_count % config.display_every == 0:
+            eta = elapsed / gen_count * (config.max_generations - gen_count)
+            print(f"  gen {gen_count:4d} | f_best={es.result.fbest:.6f} | "
+                  f"f_med={float(np.median(fitnesses)):.6f} | "
+                  f"sigma={es.sigma:.4f} | n_runs={n_runs} | "
+                  f"{elapsed:.0f}s | ETA {eta:.0f}s")
+
         # Early stopping check
         if config.early_stopping.should_stop(history["f_best"]):
             early_stopped = True
+            print(f"  Early stopping at generation {gen_count} "
+                  f"(< {config.early_stopping.rel_threshold*100:.1f}% improvement "
+                  f"over {config.early_stopping.window} gens)")
             break
 
         # Checkpoint
         if ckpt_dir and gen_count % config.checkpoint_every == 0:
             _save_checkpoint(ckpt_dir / f"gen_{gen_count:04d}.pkl", es, history, batch_seed)
+            if config.display_every > 0:
+                print(f"  >> Checkpoint saved: gen_{gen_count:04d}.pkl")
 
     wall_time = time.time() - t_start
 
