@@ -793,6 +793,51 @@ def _compute_netseq_sum(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# _compute_flux
+# ══════════════════════════════════════════════════════════════════════════════
+def _compute_flux(
+    rnap_exit_matrix: np.ndarray,
+    n_rnap: int,
+    gene_length: int,
+    glutime: float,
+) -> np.ndarray:
+    """
+    Compute per-position RNAP flux j(x) from the exit-time matrix.
+
+    Definition: j(x) is the rate at which RNAPs cross position x, in RNAPs/s.
+
+    rnap_exit_matrix[i, p] > 0  iff  RNAP i actually reached and passed
+    position p.  Counting nonzero entries per column gives the total number
+    of RNAP crossings at each position; dividing by glutime (the active
+    transcription window) gives the mean flux.
+
+    Note: we normalize by glutime rather than simtime because no new RNAPs
+    load during the runoff phase (t > glutime), so the crossing rate is only
+    meaningful during the active window.
+
+    Parameters
+    ----------
+    rnap_exit_matrix : shape (history_capacity, gene_length+1)
+                       rnap_exit_matrix[i, p] = time RNAP i exited position p
+                       (0.0 means not reached)
+    n_rnap           : number of valid RNAP rows (0..n_rnap-1)
+    gene_length      : number of nucleotide positions
+    glutime          : active transcription duration (s)
+
+    Returns
+    -------
+    flux : 1-D float64 array of length gene_length
+           j(x) in RNAPs/s.  Element 0 corresponds to position 1 (same
+           1-indexed convention as NETseq_sum).
+    """
+    if n_rnap == 0:
+        return np.zeros(gene_length, dtype=np.float64)
+    exits = rnap_exit_matrix[:n_rnap, 1 : gene_length + 1]  # (n_rnap, gene_length)
+    flux_count = np.sum(exits > 0.0, axis=0).astype(np.float64)  # (gene_length,)
+    return flux_count / glutime
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Parameter helpers
 # ══════════════════════════════════════════════════════════════════════════════
 def _default_parameters() -> dict:
@@ -1006,7 +1051,13 @@ def netseq_tasep_fast(input_parameters: dict | None = None, seed: int = 0) -> di
         gene_length=gene_length,
         snapshots=np.asarray(SNAPSHOTS, dtype=np.int64),
     )
-    return {"parameters": parameters, "NETseq_sum": netseq_sum}
+    flux = _compute_flux(
+        rnap_exit_matrix=rnap_exit_matrix,
+        n_rnap=n_rnap,
+        gene_length=gene_length,
+        glutime=glutime,
+    )
+    return {"parameters": parameters, "NETseq_sum": netseq_sum, "flux": flux}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
