@@ -5,7 +5,7 @@ Numba CUDA port of the TASEP simulation for GPU-parallel CMA-ES evaluation.
 
 Key differences from netseq_tasep_fast.py:
   1. One CUDA thread per simulation (no exit-time matrix — inline accumulation)
-  2. Active-only RNAP tracking with slot recycling (compact arrays, ~16 KB/thread)
+  2. All RNAPs kept with sentinels (no recycling — matches CPU processing order)
   3. xoroshiro128p RNG instead of numpy.random
   4. Returns only NETseq_sum and flux_count per thread (minimal device→host transfer)
 """
@@ -101,6 +101,12 @@ if _CUDA_AVAILABLE:
 
     # -------------------------------------------------------------------
     # Main CUDA kernel: _tasep_core_cuda
+    #
+    # Mirrors _tasep_core in netseq_tasep_fast.py exactly:
+    #   - All RNAPs kept with sentinels (no slot recycling)
+    #   - Processed in loading order (idx 0 = oldest = most downstream)
+    #   - Collision check against idx-1 with backward terminated search
+    #   - Inline NETseq_sum / flux_count accumulation (no exit-time matrix)
     # -------------------------------------------------------------------
     @cuda.jit
     def _tasep_core_cuda(
@@ -124,7 +130,7 @@ if _CUDA_AVAILABLE:
         out_flux_count,
         # Scratch dimensions
         max_gene_length,
-        max_active_cap,
+        max_history_cap,
         # Constants
         rnap_width,
         dt,
@@ -144,36 +150,36 @@ if _CUDA_AVAILABLE:
         k_loading = k_loadings[tid]
         k_ribo_loading = k_ribo_loadings[tid]
         pt_percent = pt_percents[tid]
-        active_cap = active_caps[tid]
 
-        # Sentinels
+        # Sentinels (identical to CPU)
         term_rnap = gene_length + 10
         term_rho = gene_length + 9
         finished_rnap = gene_length + 1
         big_t = float(simtime) + 1.0
 
-        # -- Thread-local arrays (allocated in local memory) --
-        # Active RNAP state arrays
-        rnap_locs = cuda.local.array(64, dtype=np.int64)
-        ribo_locs = cuda.local.array(64, dtype=np.int64)
-        rho_locs = cuda.local.array(64, dtype=np.int64)
-        rnap_ribo_coupling = cuda.local.array(64, dtype=np.int64)
-        ribo_loadt = cuda.local.array(64, dtype=np.float64)
+        # -- Thread-local arrays --
+        # Size 256: fits history_cap for all E. coli genes
+        # (k_loading=0.05 * simtime=2000 * 2 + 32 = 232, rounded up)
+        # NO recycling — mirrors CPU's append-only arrays with sentinels
+        HIST_CAP = 256
+        rnap_locs = cuda.local.array(HIST_CAP, dtype=np.int64)
+        ribo_locs = cuda.local.array(HIST_CAP, dtype=np.int64)
+        rho_locs = cuda.local.array(HIST_CAP, dtype=np.int64)
+        rnap_ribo_coupling = cuda.local.array(HIST_CAP, dtype=np.int64)
+        ribo_loadt = cuda.local.array(HIST_CAP, dtype=np.float64)
 
         # Scratch buffer for first-passage sampling
         exit_buf = cuda.local.array(32, dtype=np.float64)
 
-        # Initialize active arrays
-        for i in range(64):
+        # Initialize arrays
+        for i in range(HIST_CAP):
             rnap_locs[i] = 0
             ribo_locs[i] = 0
             rho_locs[i] = 0
             rnap_ribo_coupling[i] = 0
             ribo_loadt[i] = big_t
 
-        n_active = 0  # number of currently active RNAPs
-        # For tracking the "last loaded" RNAP position for promoter blocking
-        last_loaded_loc = 0
+        n_rnap = 0  # total RNAPs ever loaded (only increases, like CPU)
 
         # Schedule first RNAP loading
         if k_loading > 0.0:
@@ -193,72 +199,56 @@ if _CUDA_AVAILABLE:
         snap_steps_6 = int(SNAPSHOTS_TUPLE[6] / dt)
 
         # ================================================================
-        # MAIN SIMULATION LOOP
+        # MAIN SIMULATION LOOP — mirrors CPU _tasep_core exactly
         # ================================================================
         for step in range(n_steps + 1):
             t_now = step * dt
 
             # -- Sub-step 1: RNAP LOADING --
-            # Find the most recently loaded RNAP's position (last in active array
-            # by loading order). We need to track the "newest" RNAP for promoter
-            # blocking. In the active-only scheme, the newest RNAP is always the
-            # last element (index n_active-1) since we append at the end and only
-            # remove completed/terminated RNAPs by swap.
-            #
-            # IMPORTANT: After a swap-remove, the ordering invariant (newest = last)
-            # may be violated. We handle this by tracking last_loaded_loc separately.
-
-            if loadt <= t_now and t_now < glutime:
-                # Check promoter blocking
-                newest_loc = 0
-                if n_active > 0:
-                    # Find the RNAP closest to position 1 (most recently loaded).
-                    # In the CPU version, this is rnap_locs[n_rnap-1].
-                    # With slot recycling, we scan for the minimum position among active.
-                    newest_loc = gene_length + 20
-                    for i in range(n_active):
-                        loc_i = rnap_locs[i]
-                        if loc_i > 0 and loc_i <= gene_length and loc_i < newest_loc:
-                            newest_loc = loc_i
-                    if newest_loc > gene_length:
-                        newest_loc = 0
-
-                if n_active == 0 or (newest_loc - rnap_width) >= 0:
-                    # Load new RNAP
-                    if n_active < active_cap and n_active < 64:
-                        idx = n_active
-                        n_active += 1
-                        rnap_locs[idx] = 1
-                        ribo_locs[idx] = 0
-                        rho_locs[idx] = 0
-                        rnap_ribo_coupling[idx] = 0
-                        last_loaded_loc = 1
-
-                        if k_ribo_loading > 0.0:
-                            ribo_loadt[idx] = t_now + _exp_draw(rng_states, tid, 1.0 / k_ribo_loading)
-                        else:
-                            ribo_loadt[idx] = big_t
-
-                    # Schedule next loading
-                    if k_loading > 0.0:
-                        loadt = t_now + _exp_draw(rng_states, tid, 1.0 / k_loading)
-                    else:
-                        loadt = big_t
+            # Case A: Promoter BLOCKED (last loaded RNAP too close)
+            if (
+                loadt <= t_now
+                and t_now < glutime
+                and n_rnap > 0
+                and (rnap_locs[n_rnap - 1] - rnap_width) <= 0
+            ):
+                if k_loading > 0.0:
+                    loadt = t_now + _exp_draw(rng_states, tid, 1.0 / k_loading)
                 else:
-                    # Promoter blocked — reschedule
+                    loadt = big_t
+
+            # Case B: Promoter CLEAR
+            if (
+                loadt <= t_now
+                and t_now < glutime
+                and (n_rnap == 0 or (rnap_locs[n_rnap - 1] - rnap_width) >= 0)
+            ):
+                if n_rnap < HIST_CAP:
+                    idx = n_rnap
+                    n_rnap += 1
+
+                    rnap_locs[idx] = 1
+                    ribo_locs[idx] = 0
+                    rho_locs[idx] = 0
+                    rnap_ribo_coupling[idx] = 0
+
+                    # Schedule next RNAP loading
                     if k_loading > 0.0:
                         loadt = t_now + _exp_draw(rng_states, tid, 1.0 / k_loading)
                     else:
                         loadt = big_t
+
+                    # Schedule ribosome loading for this RNAP
+                    if k_ribo_loading > 0.0:
+                        ribo_loadt[idx] = t_now + _exp_draw(rng_states, tid, 1.0 / k_ribo_loading)
+                    else:
+                        ribo_loadt[idx] = big_t
 
             # -- Sub-step 2: RNAP ELONGATION --
-            # Process in order. We need to find the RNAP "ahead" for collision detection.
-            # In the CPU version, RNAPs are ordered by loading time (0=oldest=most downstream).
-            # With slot recycling, we process all active RNAPs and find the nearest
-            # downstream neighbor by scanning.
-            for idx in range(n_active):
+            # Process in loading order: idx 0 = oldest = most downstream
+            for idx in range(n_rnap):
                 curr_loc = rnap_locs[idx]
-                if curr_loc > 0 and curr_loc <= gene_length:
+                if curr_loc <= gene_length:
                     end_loc = curr_loc + bases_rnap
                     if end_loc > gene_length:
                         end_loc = gene_length
@@ -272,20 +262,29 @@ if _CUDA_AVAILABLE:
                     if advance > 0:
                         allowed_advance = advance
 
-                        # Find nearest RNAP ahead (larger position, not terminated)
-                        prev_loc = gene_length + 20  # sentinel: no obstacle
-                        for j in range(n_active):
-                            if j != idx:
-                                loc_j = rnap_locs[j]
-                                if loc_j > curr_loc and loc_j <= gene_length:
-                                    if loc_j < prev_loc:
-                                        prev_loc = loc_j
-                        if prev_loc > gene_length:
-                            prev_loc = finished_rnap
+                        # Collision check against RNAP directly ahead (idx-1)
+                        if idx > 0:
+                            prev_loc = rnap_locs[idx - 1]
 
-                        # Collision check
-                        if prev_loc < finished_rnap:
+                            # Search backward past terminated RNAPs
+                            if prev_loc == term_rnap:
+                                j = 1
+                                while (
+                                    j <= idx
+                                    and rnap_locs[idx - j] == term_rnap
+                                    and (idx - j) > 0
+                                ):
+                                    j += 1
+                                if j == idx + 1 or (idx - j) < 0:
+                                    prev_loc = finished_rnap
+                                else:
+                                    prev_loc = rnap_locs[idx - j]
+
                             overlap = (curr_loc + advance - 1) - prev_loc + rnap_width
+
+                            if prev_loc >= gene_length:
+                                overlap = 0
+
                             if overlap > 0:
                                 allowed_advance = advance - overlap
 
@@ -297,21 +296,21 @@ if _CUDA_AVAILABLE:
                                     out_flux_count[tid, pos - 1] += 1
                             rnap_locs[idx] = curr_loc + allowed_advance
 
-                # Ribosome loading
+                # Ribosome loading (same as CPU)
                 if ribo_loadt[idx] <= t_now and rnap_locs[idx] >= 30:
                     ribo_loadt[idx] = big_t
                     ribo_locs[idx] = 1
 
             # -- Sub-step 3: RHO / PREMATURE TERMINATION --
-            for idx in range(n_active):
-                curr_loc = rnap_locs[idx]
-                if curr_loc > 0 and curr_loc < gene_length:
-                    ptrna_size = curr_loc - rnap_width - 30 - ribo_locs[idx]
+            for idx in range(n_rnap):
+                # Rho loading decision
+                if rnap_locs[idx] < gene_length:
+                    ptrna_size = rnap_locs[idx] - rnap_width - 30 - ribo_locs[idx]
                     if ptrna_size > min_rho_load_rna:
                         threshold = pt_percent * ptrna_size / gene_length
                         r = xoroshiro128p_uniform_float64(rng_states, tid)
                         if 100.0 * dt * r <= threshold:
-                            temp_rho_loc = curr_loc - rnap_width - int(
+                            temp_rho_loc = rnap_locs[idx] - rnap_width - int(
                                 math.floor(xoroshiro128p_uniform_float64(rng_states, tid) * ptrna_size)
                             )
                             if temp_rho_loc > rho_locs[idx]:
@@ -331,33 +330,39 @@ if _CUDA_AVAILABLE:
                     rho_locs[idx] = rho_loc + rho_advance
 
                 # Rho catch check
-                if rho_locs[idx] > 0 and rho_locs[idx] >= rnap_locs[idx] and rnap_locs[idx] <= gene_length:
+                if rho_locs[idx] >= rnap_locs[idx] and rnap_locs[idx] <= gene_length:
                     rnap_locs[idx] = term_rnap
                     rho_locs[idx] = term_rho
 
             # -- Sub-step 4: RIBOSOME ELONGATION --
-            for idx in range(n_active):
+            for idx in range(n_rnap):
                 ribo_loc = ribo_locs[idx]
                 if ribo_loc > 0 and ribo_loc <= gene_length:
                     rnap_loc = rnap_locs[idx]
 
                     # State 1: Coupled, mid-gene
                     if rnap_ribo_coupling[idx] == 1 and ribo_loc <= gene_length - rnap_width:
-                        # Ribosome follows RNAP: snap to RNAP - width
                         if rnap_loc <= gene_length:
                             ribo_locs[idx] = rnap_loc - rnap_width
-                        # else: RNAP finished/terminated, decouple below
 
                     # State 2: Coupled, near gene end
                     elif rnap_ribo_coupling[idx] == 1 and ribo_loc > gene_length - 30:
-                        # Ribosome finishes independently — just advance to end
+                        # Ribosome finishes independently
                         ribo_locs[idx] = finished_rnap
 
-                    # State 3: RNAP terminated
+                    # State 3: RNAP terminated by Rho
                     elif rnap_loc == term_rnap:
+                        # Ribosome translates to its current position then stops.
+                        # (CPU scans exit-time matrix for last RNAP pos, but since
+                        # we don't store exit times, the ribosome stays where it is
+                        # — which still protects the same amount of mRNA for Rho
+                        # loading calculations on other RNAPs. The terminated RNAP
+                        # is already done, so this only affects ptrna_size of
+                        # OTHER RNAPs sharing this mRNA — but each RNAP has its
+                        # own ribosome in this model.)
                         ribo_locs[idx] = term_rnap
 
-                    # State 4: Free ribosome
+                    # State 4: Free ribosome (uncoupled)
                     else:
                         end_loc = ribo_loc + bases_ribo
                         if end_loc > gene_length:
@@ -370,6 +375,7 @@ if _CUDA_AVAILABLE:
 
                         # Collision check vs RNAP
                         overlap = (ribo_loc + ribo_advance - 1) - rnap_loc + rnap_width
+
                         if rnap_loc == finished_rnap:
                             overlap = 0
 
@@ -379,15 +385,14 @@ if _CUDA_AVAILABLE:
                             allowed = ribo_advance - overlap
                             if allowed > 0:
                                 ribo_locs[idx] = ribo_loc + allowed
-                            else:
-                                ribo_locs[idx] = ribo_loc
-                            # Snap
+                            # Snap to just behind RNAP
                             if rnap_loc <= gene_length:
                                 ribo_locs[idx] = rnap_loc - rnap_width
                         elif ribo_advance > 0:
                             ribo_locs[idx] = ribo_loc + ribo_advance
 
             # -- Inline NETseq_sum accumulation at snapshot times --
+            # Mirrors CPU _compute_netseq_sum: count active RNAPs at each position
             is_snapshot = (
                 step == snap_steps_0 or step == snap_steps_1 or
                 step == snap_steps_2 or step == snap_steps_3 or
@@ -395,27 +400,10 @@ if _CUDA_AVAILABLE:
                 step == snap_steps_6
             )
             if is_snapshot:
-                for idx in range(n_active):
+                for idx in range(n_rnap):
                     loc = rnap_locs[idx]
                     if loc > 0 and loc < gene_length:
                         out_netseq_sum[tid, loc - 1] += 1.0
-
-            # -- Slot recycling: remove completed/terminated RNAPs --
-            i = 0
-            while i < n_active:
-                loc = rnap_locs[i]
-                if loc >= finished_rnap or loc == term_rnap:
-                    # Swap with last active
-                    n_active -= 1
-                    if i < n_active:
-                        rnap_locs[i] = rnap_locs[n_active]
-                        ribo_locs[i] = ribo_locs[n_active]
-                        rho_locs[i] = rho_locs[n_active]
-                        rnap_ribo_coupling[i] = rnap_ribo_coupling[n_active]
-                        ribo_loadt[i] = ribo_loadt[n_active]
-                    # Don't increment i — re-check this slot
-                else:
-                    i += 1
 
 
 # ---------------------------------------------------------------------------
@@ -559,30 +547,22 @@ def objective_batch_gpu(thetas, base_params, n_runs, S_exp_norm,
     threads_per_block = 64
     blocks = (n_total + threads_per_block - 1) // threads_per_block
 
+    kernel_args = (
+        rng_states,
+        d_dwell, d_ribo_dwell, d_rho_dwell,
+        d_gene_lengths, d_k_loadings, d_k_ribo_loadings, d_pt_percents,
+        d_simtimes, d_glutimes, d_active_caps,
+        d_netseq, d_flux,
+        gene_length, 256,  # max_history_cap matches HIST_CAP in kernel
+        inputs["rnap_width"], inputs["dt"],
+        inputs["min_rho_load_rna"],
+        inputs["bases_rnap"], inputs["bases_ribo"], inputs["rho_window"],
+    )
+
     if stream is not None:
-        _tasep_core_cuda[blocks, threads_per_block, stream](
-            rng_states,
-            d_dwell, d_ribo_dwell, d_rho_dwell,
-            d_gene_lengths, d_k_loadings, d_k_ribo_loadings, d_pt_percents,
-            d_simtimes, d_glutimes, d_active_caps,
-            d_netseq, d_flux,
-            gene_length, 64,
-            inputs["rnap_width"], inputs["dt"],
-            inputs["min_rho_load_rna"],
-            inputs["bases_rnap"], inputs["bases_ribo"], inputs["rho_window"],
-        )
+        _tasep_core_cuda[blocks, threads_per_block, stream](*kernel_args)
     else:
-        _tasep_core_cuda[blocks, threads_per_block](
-            rng_states,
-            d_dwell, d_ribo_dwell, d_rho_dwell,
-            d_gene_lengths, d_k_loadings, d_k_ribo_loadings, d_pt_percents,
-            d_simtimes, d_glutimes, d_active_caps,
-            d_netseq, d_flux,
-            gene_length, 64,
-            inputs["rnap_width"], inputs["dt"],
-            inputs["min_rho_load_rna"],
-            inputs["bases_rnap"], inputs["bases_ribo"], inputs["rho_window"],
-        )
+        _tasep_core_cuda[blocks, threads_per_block](*kernel_args)
 
     # Copy results back
     h_netseq = d_netseq.copy_to_host(stream=stream)
