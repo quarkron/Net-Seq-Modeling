@@ -180,6 +180,7 @@ if _CUDA_AVAILABLE:
             ribo_loadt[i] = big_t
 
         n_rnap = 0  # total RNAPs ever loaded (only increases, like CPU)
+        first_active = 0  # lowest index still on gene (optimization: skip completed)
 
         # Schedule first RNAP loading
         if k_loading > 0.0:
@@ -246,7 +247,8 @@ if _CUDA_AVAILABLE:
 
             # -- Sub-step 2: RNAP ELONGATION --
             # Process in loading order: idx 0 = oldest = most downstream
-            for idx in range(n_rnap):
+            # Start from first_active to skip completed/terminated RNAPs
+            for idx in range(first_active, n_rnap):
                 curr_loc = rnap_locs[idx]
                 if curr_loc <= gene_length:
                     end_loc = curr_loc + bases_rnap
@@ -302,7 +304,7 @@ if _CUDA_AVAILABLE:
                     ribo_locs[idx] = 1
 
             # -- Sub-step 3: RHO / PREMATURE TERMINATION --
-            for idx in range(n_rnap):
+            for idx in range(first_active, n_rnap):
                 # Rho loading decision
                 if rnap_locs[idx] < gene_length:
                     ptrna_size = rnap_locs[idx] - rnap_width - 30 - ribo_locs[idx]
@@ -335,7 +337,7 @@ if _CUDA_AVAILABLE:
                     rho_locs[idx] = term_rho
 
             # -- Sub-step 4: RIBOSOME ELONGATION --
-            for idx in range(n_rnap):
+            for idx in range(first_active, n_rnap):
                 ribo_loc = ribo_locs[idx]
                 if ribo_loc > 0 and ribo_loc <= gene_length:
                     rnap_loc = rnap_locs[idx]
@@ -400,10 +402,14 @@ if _CUDA_AVAILABLE:
                 step == snap_steps_6
             )
             if is_snapshot:
-                for idx in range(n_rnap):
+                for idx in range(first_active, n_rnap):
                     loc = rnap_locs[idx]
-                    if loc > 0 and loc < gene_length:
-                        out_netseq_sum[tid, loc - 1] += 1.0
+                    if loc > 1 and loc <= gene_length:
+                        out_netseq_sum[tid, loc - 2] += 1.0
+
+            # Advance first_active past completed/terminated RNAPs
+            while first_active < n_rnap and rnap_locs[first_active] > gene_length:
+                first_active += 1
 
 
 # ---------------------------------------------------------------------------
