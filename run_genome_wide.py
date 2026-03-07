@@ -148,6 +148,20 @@ def run_genome_wide(args):
         print("All genes already processed. Use --force to re-run.")
         return
 
+    # Sort genes by length (descending) to process longest first,
+    # avoiding stragglers at the end when most workers are idle.
+    def _csv_line_count(path):
+        try:
+            with open(path) as f:
+                return sum(1 for _ in f)
+        except Exception:
+            return 0
+
+    genes.sort(
+        key=lambda g: _csv_line_count(netseq_dir / f"NETSEQ_{g}.csv"),
+        reverse=True,
+    )
+
     total = len(genes)
     print(f"Processing {total} genes → {output_dir}")
 
@@ -262,8 +276,8 @@ def main():
                         help="Force re-processing of already-completed genes")
     parser.add_argument("--n-gpus", type=int, default=99,
                         help="Max GPUs to use (default: all available)")
-    parser.add_argument("--streams-per-gpu", type=int, default=3,
-                        help="CUDA streams per GPU (default: 3)")
+    parser.add_argument("--streams-per-gpu", type=int, default=1,
+                        help="CUDA streams per GPU (default: 1, concurrent streams don't improve throughput)")
     args = parser.parse_args()
     run_genome_wide(args)
 

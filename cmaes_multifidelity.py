@@ -31,9 +31,9 @@ except ImportError:
 @dataclass
 class NRunsSchedule:
     """Multi-fidelity N_RUNS schedule based on sigma."""
-    n_runs_low: int = 400
-    n_runs_med: int = 800
-    n_runs_high: int = 1600
+    n_runs_low: int = 200
+    n_runs_med: int = 400
+    n_runs_high: int = 800
     sigma_thresh_med: float = 0.8   # fraction of sigma0
     sigma_thresh_high: float = 0.6  # fraction of sigma0
     max_threads_per_gene: int = 60000

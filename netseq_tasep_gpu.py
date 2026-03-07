@@ -3,11 +3,13 @@ netseq_tasep_gpu.py
 ===================
 Numba CUDA port of the TASEP simulation for GPU-parallel CMA-ES evaluation.
 
-Key differences from netseq_tasep_fast.py:
-  1. One CUDA thread per simulation (no exit-time matrix — inline accumulation)
-  2. All RNAPs kept with sentinels (no recycling — matches CPU processing order)
-  3. xoroshiro128p RNG instead of numpy.random
-  4. Returns only NETseq_sum and flux_count per thread (minimal device→host transfer)
+v3.0 — GPU optimizations (Phases 1+2):
+  - Float32 arithmetic (32x FP32:FP64 throughput ratio on Ampere)
+  - Int32 thread-local arrays (halved local memory per thread)
+  - Dwell profile deduplication (n_candidates rows, not n_total)
+  - Optional flux computation (disabled during CMA-ES optimization)
+  - GPU-side atomic reduction (n_candidates output rows, not n_total)
+  - GPU-side MSE kernel with block-level reduction (minimal D2H transfer)
 """
 
 import math
@@ -25,6 +27,7 @@ try:
     from numba import cuda
     from numba.cuda.random import (
         create_xoroshiro128p_states,
+        xoroshiro128p_uniform_float32,
         xoroshiro128p_uniform_float64,
     )
 
@@ -52,32 +55,34 @@ N_SNAPSHOTS = 7
 
 
 # ---------------------------------------------------------------------------
-# Device helper: exponential draw from xoroshiro128p
+# CUDA kernels (only compiled when CUDA is available)
 # ---------------------------------------------------------------------------
 if _CUDA_AVAILABLE:
 
+    # -----------------------------------------------------------------------
+    # Device helper: exponential draw (float32 RNG)
+    # -----------------------------------------------------------------------
     @cuda.jit(device=True, inline=True)
     def _exp_draw(rng_states, tid, scale):
         """Draw Exp(scale) using inverse-CDF: -scale * ln(U)."""
-        u = xoroshiro128p_uniform_float64(rng_states, tid)
-        # Guard against u==0 (would give inf)
-        if u <= 0.0:
-            u = 1e-300
+        u = xoroshiro128p_uniform_float32(rng_states, tid)
+        if u < 1e-30:
+            u = 1e-30
         return -scale * math.log(u)
 
-    # -------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Device function: _sample_first_passage_cuda
-    # -------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     @cuda.jit(device=True)
     def _sample_first_passage_cuda(
         rng_states,
         tid,
-        dwell_profile,        # global or shared memory array
+        dwell_profile,        # global memory array
         start_pos,
         end_pos,
         t_now,
         dt,
-        exit_times,           # thread-local scratch buffer (registers/local)
+        exit_times,           # thread-local scratch buffer
     ):
         """
         GPU equivalent of _sample_first_passage in netseq_tasep_fast.py.
@@ -99,57 +104,53 @@ if _CUDA_AVAILABLE:
             pos += 1
         return count
 
-    # -------------------------------------------------------------------
-    # Main CUDA kernel: _tasep_core_cuda
+    # -----------------------------------------------------------------------
+    # Main CUDA kernel: _tasep_core_cuda (v3.0)
     #
-    # Mirrors _tasep_core in netseq_tasep_fast.py exactly:
-    #   - All RNAPs kept with sentinels (no slot recycling)
-    #   - Processed in loading order (idx 0 = oldest = most downstream)
-    #   - Collision check against idx-1 with backward terminated search
-    #   - Inline NETseq_sum / flux_count accumulation (no exit-time matrix)
-    # -------------------------------------------------------------------
+    # Changes from v2.2:
+    #   - Float32 local arrays + RNG (halved local memory per thread)
+    #   - Deduplicated dwell profiles: reads dwell_profiles[candidate_idx]
+    #   - Scalar physical params (not per-thread arrays)
+    #   - Atomic reduction: writes to out_netseq_sum[candidate_idx, ...]
+    #   - Optional flux via compute_flux flag
+    # -----------------------------------------------------------------------
     @cuda.jit
     def _tasep_core_cuda(
         rng_states,
-        # Per-candidate dwell profiles: (n_total_sims, gene_length+1) in global mem
+        # Deduplicated dwell profiles: (n_candidates, gene_length+1) float32
         dwell_profiles,
-        # Shared ribo dwell: (gene_length+1,) — identical for all sims
+        # Shared ribo dwell: (gene_length+1,) float32
         ribo_dwell_profiles,
-        # Shared rho dwell: (gene_length+1,) — identical for all sims
+        # Shared rho dwell: (gene_length+1,) float32
         rho_dwell_profiles,
-        # Scalar params broadcast to all threads (1-D arrays of length n_total_sims)
-        gene_lengths,
-        k_loadings,
-        k_ribo_loadings,
-        pt_percents,
-        simtimes,
-        glutimes,
-        active_caps,
-        # Output arrays: (n_total_sims, max_gene_length)
+        # Output: (n_candidates, gene_length) float32 — atomic reduction
         out_netseq_sum,
+        # Output: (n_candidates, gene_length) int32, or (1,1) dummy
         out_flux_count,
-        # Scratch dimensions
-        max_gene_length,
-        max_history_cap,
+        # Simulation dimensions
+        n_runs,           # int32: threads per candidate
+        gene_length,      # int32
+        compute_flux,     # int32: 0=skip flux, 1=compute flux
+        # Scalar physical params (shared by all threads)
+        k_loading,        # float32
+        k_ribo_loading,   # float32
+        pt_percent,       # float32
+        simtime,          # int32
+        glutime,          # float32
         # Constants
-        rnap_width,
-        dt,
-        min_rho_load_rna,
-        bases_rnap,
-        bases_ribo,
-        rho_window,
+        rnap_width,       # int32
+        dt,               # float32
+        min_rho_load_rna, # int32
+        bases_rnap,       # int32
+        bases_ribo,       # int32
+        rho_window,       # int32
     ):
         tid = cuda.grid(1)
         n_total = rng_states.shape[0]
         if tid >= n_total:
             return
 
-        gene_length = gene_lengths[tid]
-        simtime = simtimes[tid]
-        glutime = glutimes[tid]
-        k_loading = k_loadings[tid]
-        k_ribo_loading = k_ribo_loadings[tid]
-        pt_percent = pt_percents[tid]
+        candidate_idx = tid // n_runs
 
         # Sentinels (identical to CPU)
         term_rnap = gene_length + 10
@@ -157,19 +158,18 @@ if _CUDA_AVAILABLE:
         finished_rnap = gene_length + 1
         big_t = float(simtime) + 1.0
 
-        # -- Thread-local arrays --
+        # -- Thread-local arrays (int32/float32 for reduced local memory) --
         # Size 128: fits history_cap for all E. coli genes
-        # (k_loading=0.05 * simtime=2000 * 1.2 = 120, rounded up with margin)
-        # NO recycling — mirrors CPU's append-only arrays with sentinels
+        # (k_loading=0.05 * simtime=2000 * 1.2 = 120, rounded up)
         HIST_CAP = 128
-        rnap_locs = cuda.local.array(HIST_CAP, dtype=np.int64)
-        ribo_locs = cuda.local.array(HIST_CAP, dtype=np.int64)
-        rho_locs = cuda.local.array(HIST_CAP, dtype=np.int64)
-        rnap_ribo_coupling = cuda.local.array(HIST_CAP, dtype=np.int64)
-        ribo_loadt = cuda.local.array(HIST_CAP, dtype=np.float64)
+        rnap_locs = cuda.local.array(HIST_CAP, dtype=np.int32)
+        ribo_locs = cuda.local.array(HIST_CAP, dtype=np.int32)
+        rho_locs = cuda.local.array(HIST_CAP, dtype=np.int32)
+        rnap_ribo_coupling = cuda.local.array(HIST_CAP, dtype=np.int32)
+        ribo_loadt = cuda.local.array(HIST_CAP, dtype=np.float32)
 
         # Scratch buffer for first-passage sampling
-        exit_buf = cuda.local.array(32, dtype=np.float64)
+        exit_buf = cuda.local.array(32, dtype=np.float32)
 
         # Initialize arrays
         for i in range(HIST_CAP):
@@ -180,7 +180,7 @@ if _CUDA_AVAILABLE:
             ribo_loadt[i] = big_t
 
         n_rnap = 0  # total RNAPs ever loaded (only increases, like CPU)
-        first_active = 0  # lowest index still on gene (optimization: skip completed)
+        first_active = 0  # lowest index still on gene
 
         # Schedule first RNAP loading
         if k_loading > 0.0:
@@ -247,7 +247,6 @@ if _CUDA_AVAILABLE:
 
             # -- Sub-step 2: RNAP ELONGATION --
             # Process in loading order: idx 0 = oldest = most downstream
-            # Start from first_active to skip completed/terminated RNAPs
             for idx in range(first_active, n_rnap):
                 curr_loc = rnap_locs[idx]
                 if curr_loc <= gene_length:
@@ -257,7 +256,7 @@ if _CUDA_AVAILABLE:
 
                     advance = _sample_first_passage_cuda(
                         rng_states, tid,
-                        dwell_profiles[tid],
+                        dwell_profiles[candidate_idx],
                         curr_loc, end_loc, t_now, dt, exit_buf,
                     )
 
@@ -290,12 +289,13 @@ if _CUDA_AVAILABLE:
                             if overlap > 0:
                                 allowed_advance = advance - overlap
 
-                        # Advance and count flux
+                        # Advance and optionally count flux
                         if allowed_advance > 0:
-                            for k in range(allowed_advance):
-                                pos = curr_loc + k
-                                if pos >= 1 and pos <= gene_length:
-                                    out_flux_count[tid, pos - 1] += 1
+                            if compute_flux:
+                                for k in range(allowed_advance):
+                                    pos = curr_loc + k
+                                    if pos >= 1 and pos <= gene_length:
+                                        cuda.atomic.add(out_flux_count, (candidate_idx, pos - 1), 1)
                             rnap_locs[idx] = curr_loc + allowed_advance
 
                 # Ribosome loading (same as CPU)
@@ -310,10 +310,10 @@ if _CUDA_AVAILABLE:
                     ptrna_size = rnap_locs[idx] - rnap_width - 30 - ribo_locs[idx]
                     if ptrna_size > min_rho_load_rna:
                         threshold = pt_percent * ptrna_size / gene_length
-                        r = xoroshiro128p_uniform_float64(rng_states, tid)
+                        r = xoroshiro128p_uniform_float32(rng_states, tid)
                         if 100.0 * dt * r <= threshold:
                             temp_rho_loc = rnap_locs[idx] - rnap_width - int(
-                                math.floor(xoroshiro128p_uniform_float64(rng_states, tid) * ptrna_size)
+                                math.floor(xoroshiro128p_uniform_float32(rng_states, tid) * ptrna_size)
                             )
                             if temp_rho_loc > rho_locs[idx]:
                                 rho_locs[idx] = temp_rho_loc
@@ -349,19 +349,10 @@ if _CUDA_AVAILABLE:
 
                     # State 2: Coupled, near gene end
                     elif rnap_ribo_coupling[idx] == 1 and ribo_loc > gene_length - 30:
-                        # Ribosome finishes independently
                         ribo_locs[idx] = finished_rnap
 
                     # State 3: RNAP terminated by Rho
                     elif rnap_loc == term_rnap:
-                        # Ribosome translates to its current position then stops.
-                        # (CPU scans exit-time matrix for last RNAP pos, but since
-                        # we don't store exit times, the ribosome stays where it is
-                        # — which still protects the same amount of mRNA for Rho
-                        # loading calculations on other RNAPs. The terminated RNAP
-                        # is already done, so this only affects ptrna_size of
-                        # OTHER RNAPs sharing this mRNA — but each RNAP has its
-                        # own ribosome in this model.)
                         ribo_locs[idx] = term_rnap
 
                     # State 4: Free ribosome (uncoupled)
@@ -393,8 +384,7 @@ if _CUDA_AVAILABLE:
                         elif ribo_advance > 0:
                             ribo_locs[idx] = ribo_loc + ribo_advance
 
-            # -- Inline NETseq_sum accumulation at snapshot times --
-            # Mirrors CPU _compute_netseq_sum: count active RNAPs at each position
+            # -- Snapshot: atomic reduction to (n_candidates, gene_length) --
             is_snapshot = (
                 step == snap_steps_0 or step == snap_steps_1 or
                 step == snap_steps_2 or step == snap_steps_3 or
@@ -405,19 +395,92 @@ if _CUDA_AVAILABLE:
                 for idx in range(first_active, n_rnap):
                     loc = rnap_locs[idx]
                     if loc > 1 and loc <= gene_length:
-                        out_netseq_sum[tid, loc - 2] += 1.0
+                        cuda.atomic.add(out_netseq_sum, (candidate_idx, loc - 2), np.float32(1.0))
 
             # Advance first_active past completed/terminated RNAPs
             while first_active < n_rnap and rnap_locs[first_active] > gene_length:
                 first_active += 1
 
+    # -------------------------------------------------------------------
+    # MSE reduction kernel (one thread block per candidate)
+    #
+    # Uses shared-memory block reduction (inspired by warp-shuffle
+    # reduction patterns from GPU fluid simulation literature).
+    # -------------------------------------------------------------------
+    @cuda.jit
+    def _compute_mse_cuda(
+        netseq_sum,    # (n_candidates, gene_length) float32 — raw counts
+        S_exp_norm,    # (gene_length,) float32 — experimental signal
+        mse_out,       # (n_candidates,) float32 — output MSE per candidate
+        n_runs,        # int32
+        gene_length,   # int32
+        n_candidates,  # int32
+    ):
+        c_idx = cuda.blockIdx.x
+        if c_idx >= n_candidates:
+            return
+        t = cuda.threadIdx.x
+        block_size = cuda.blockDim.x
+
+        sdata = cuda.shared.array(256, dtype=np.float32)
+
+        # Step 1: sum netseq_sum[c_idx, :] for normalization
+        local_sum = np.float32(0.0)
+        pos = t
+        while pos < gene_length:
+            local_sum += netseq_sum[c_idx, pos]
+            pos += block_size
+        sdata[t] = local_sum
+        cuda.syncthreads()
+
+        s = block_size // 2
+        while s > 0:
+            if t < s:
+                sdata[t] += sdata[t + s]
+            cuda.syncthreads()
+            s //= 2
+
+        total_sum = sdata[0]
+        cuda.syncthreads()
+
+        # s_mean = total_sum / (n_runs * gene_length)
+        denom = np.float32(n_runs) * np.float32(gene_length)
+        s_mean = total_sum / denom
+
+        if s_mean <= np.float32(0.0):
+            if t == 0:
+                mse_out[c_idx] = np.float32(1e6)
+            return
+
+        # Step 2: MSE = mean((S_exp_norm[pos] - sim_norm[pos])^2)
+        norm_factor = np.float32(n_runs) * s_mean
+        local_mse = np.float32(0.0)
+        pos = t
+        while pos < gene_length:
+            sim_norm = netseq_sum[c_idx, pos] / norm_factor
+            diff = S_exp_norm[pos] - sim_norm
+            local_mse += diff * diff
+            pos += block_size
+        sdata[t] = local_mse
+        cuda.syncthreads()
+
+        s = block_size // 2
+        while s > 0:
+            if t < s:
+                sdata[t] += sdata[t + s]
+            cuda.syncthreads()
+            s //= 2
+
+        if t == 0:
+            mse_out[c_idx] = sdata[0] / np.float32(gene_length)
+
 
 # ---------------------------------------------------------------------------
-# Host-side: objective_batch_gpu
+# Host-side helpers
 # ---------------------------------------------------------------------------
 
 def _prepare_kernel_inputs(thetas, base_params, n_runs):
-    """Build per-simulation arrays for the GPU kernel."""
+    """Build deduplicated arrays and scalar params for the GPU kernel."""
     from netseq_tasep_fast import _estimate_caps
 
     n_candidates = len(thetas)
@@ -443,66 +506,79 @@ def _prepare_kernel_inputs(thetas, base_params, n_runs):
     bases_ribo = int(math.ceil(ribo_speed * 10.0 * dt))
     rho_window = max(1, int(round(ribo_speed * 5.0)))
 
-    active_cap, _ = _estimate_caps(gene_length, rnap_width, k_loading, simtime)
-    if active_cap > 64:
-        active_cap = 64  # Hard limit for local array size in kernel
-
-    # Build dwell profiles per simulation
-    dwell_all = np.zeros((n_total, gene_length + 1), dtype=np.float64)
-
-    # ribo/rho dwell are identical for all sims — store as single 1D row
-    ribo_dwell_all = np.zeros(gene_length + 1, dtype=np.float64)
-    ribo_dwell_all[1:] = dx / ribo_speed
-    rho_dwell_all = np.zeros(gene_length + 1, dtype=np.float64)
-    if rut_speed > 0:
-        rho_dwell_all[1:] = dx / rut_speed
+    # Deduplicated dwell profiles: (n_candidates, gene_length+1) float32
+    dwell_all = np.zeros((n_candidates, gene_length + 1), dtype=np.float32)
 
     for c_idx, theta in enumerate(thetas):
         D = np.exp(theta)
         D_norm = D / np.mean(D)
-        row = np.zeros(gene_length + 1, dtype=np.float64)
-        row[1:] = (dx / rnap_speed) * D_norm
-        for r_idx in range(n_runs):
-            sim_idx = c_idx * n_runs + r_idx
-            dwell_all[sim_idx] = row
+        dwell_all[c_idx, 1:] = ((dx / rnap_speed) * D_norm).astype(np.float32)
 
-    # Scalar param arrays
-    gene_lengths = np.full(n_total, gene_length, dtype=np.int64)
-    k_loadings = np.full(n_total, k_loading, dtype=np.float64)
-    k_ribo_loadings = np.full(n_total, k_ribo_loading, dtype=np.float64)
-    pt_percents = np.full(n_total, pt_percent, dtype=np.float64)
-    simtimes_arr = np.full(n_total, simtime, dtype=np.int64)
-    glutimes_arr = np.full(n_total, glutime, dtype=np.float64)
-    active_caps_arr = np.full(n_total, active_cap, dtype=np.int64)
+    # ribo/rho dwell are identical for all sims — single 1D row
+    ribo_dwell_all = np.zeros(gene_length + 1, dtype=np.float32)
+    ribo_dwell_all[1:] = np.float32(dx / ribo_speed)
+    rho_dwell_all = np.zeros(gene_length + 1, dtype=np.float32)
+    if rut_speed > 0:
+        rho_dwell_all[1:] = np.float32(dx / rut_speed)
 
     return {
         "dwell_profiles": dwell_all,
         "ribo_dwell_profiles": ribo_dwell_all,
         "rho_dwell_profiles": rho_dwell_all,
-        "gene_lengths": gene_lengths,
-        "k_loadings": k_loadings,
-        "k_ribo_loadings": k_ribo_loadings,
-        "pt_percents": pt_percents,
-        "simtimes": simtimes_arr,
-        "glutimes": glutimes_arr,
-        "active_caps": active_caps_arr,
         "gene_length": gene_length,
         "n_total": n_total,
         "n_candidates": n_candidates,
         "n_runs": n_runs,
-        "rnap_width": rnap_width,
-        "dt": dt,
-        "min_rho_load_rna": min_rho_load_rna,
-        "bases_rnap": bases_rnap,
-        "bases_ribo": bases_ribo,
-        "rho_window": rho_window,
+        # Scalar params (typed for kernel)
+        "k_loading": np.float32(k_loading),
+        "k_ribo_loading": np.float32(k_ribo_loading),
+        "pt_percent": np.float32(pt_percent),
+        "simtime": np.int32(simtime),
+        "glutime": np.float32(glutime),
+        "rnap_width": np.int32(rnap_width),
+        "dt": np.float32(dt),
+        "min_rho_load_rna": np.int32(min_rho_load_rna),
+        "bases_rnap": np.int32(bases_rnap),
+        "bases_ribo": np.int32(bases_ribo),
+        "rho_window": np.int32(rho_window),
     }
 
+
+def _launch_tasep_kernel(inputs, rng_states, d_dwell, d_ribo_dwell, d_rho_dwell,
+                         d_netseq, d_flux, compute_flux, stream):
+    """Launch the TASEP kernel with the standard argument layout."""
+    n_total = inputs["n_total"]
+    threads_per_block = 128
+    blocks = (n_total + threads_per_block - 1) // threads_per_block
+
+    kernel_args = (
+        rng_states,
+        d_dwell, d_ribo_dwell, d_rho_dwell,
+        d_netseq, d_flux,
+        np.int32(inputs["n_runs"]), np.int32(inputs["gene_length"]),
+        np.int32(compute_flux),
+        inputs["k_loading"], inputs["k_ribo_loading"], inputs["pt_percent"],
+        inputs["simtime"], inputs["glutime"],
+        inputs["rnap_width"], inputs["dt"], inputs["min_rho_load_rna"],
+        inputs["bases_rnap"], inputs["bases_ribo"], inputs["rho_window"],
+    )
+
+    if stream is not None:
+        _tasep_core_cuda[blocks, threads_per_block, stream](*kernel_args)
+    else:
+        _tasep_core_cuda[blocks, threads_per_block](*kernel_args)
+
+
+# ---------------------------------------------------------------------------
+# Host-side: objective_batch_gpu (CMA-ES evaluation)
+# ---------------------------------------------------------------------------
 
 def objective_batch_gpu(thetas, base_params, n_runs, S_exp_norm,
                         base_seed=0, device_id=0, stream=None):
     """
     GPU-accelerated batch evaluation of CMA-ES candidates.
+
+    Uses atomic reduction + GPU-side MSE kernel for minimal D2H transfer.
 
     Args:
         thetas: list of candidate theta vectors (log-space dwell profiles)
@@ -530,68 +606,101 @@ def objective_batch_gpu(thetas, base_params, n_runs, S_exp_norm,
     # Allocate RNG states
     rng_states = create_xoroshiro128p_states(n_total, seed=base_seed)
 
-    # Transfer to device
+    # Transfer dwell profiles to device
     d_dwell = cuda.to_device(inputs["dwell_profiles"], stream=stream)
     d_ribo_dwell = cuda.to_device(inputs["ribo_dwell_profiles"], stream=stream)
     d_rho_dwell = cuda.to_device(inputs["rho_dwell_profiles"], stream=stream)
-    d_gene_lengths = cuda.to_device(inputs["gene_lengths"], stream=stream)
-    d_k_loadings = cuda.to_device(inputs["k_loadings"], stream=stream)
-    d_k_ribo_loadings = cuda.to_device(inputs["k_ribo_loadings"], stream=stream)
-    d_pt_percents = cuda.to_device(inputs["pt_percents"], stream=stream)
-    d_simtimes = cuda.to_device(inputs["simtimes"], stream=stream)
-    d_glutimes = cuda.to_device(inputs["glutimes"], stream=stream)
-    d_active_caps = cuda.to_device(inputs["active_caps"], stream=stream)
 
-    # Output arrays
-    d_netseq = cuda.to_device(np.zeros((n_total, gene_length), dtype=np.float64), stream=stream)
-    d_flux = cuda.to_device(np.zeros((n_total, gene_length), dtype=np.int64), stream=stream)
+    # Output: reduced (n_candidates, gene_length) — not (n_total, ...)
+    d_netseq = cuda.to_device(
+        np.zeros((n_candidates, gene_length), dtype=np.float32), stream=stream)
+    # Flux disabled during CMA-ES: tiny dummy allocation
+    d_flux_dummy = cuda.to_device(
+        np.zeros((1, 1), dtype=np.int32), stream=stream)
 
-    # Launch kernel
-    threads_per_block = 128
-    blocks = (n_total + threads_per_block - 1) // threads_per_block
+    # S_exp_norm on device for MSE kernel
+    d_S_exp = cuda.to_device(
+        np.asarray(S_exp_norm, dtype=np.float32), stream=stream)
+    d_mse = cuda.device_array(n_candidates, dtype=np.float32, stream=stream)
 
-    kernel_args = (
-        rng_states,
-        d_dwell, d_ribo_dwell, d_rho_dwell,
-        d_gene_lengths, d_k_loadings, d_k_ribo_loadings, d_pt_percents,
-        d_simtimes, d_glutimes, d_active_caps,
-        d_netseq, d_flux,
-        gene_length, 128,  # max_history_cap matches HIST_CAP in kernel
-        inputs["rnap_width"], inputs["dt"],
-        inputs["min_rho_load_rna"],
-        inputs["bases_rnap"], inputs["bases_ribo"], inputs["rho_window"],
-    )
+    # Launch TASEP kernel (compute_flux=0)
+    _launch_tasep_kernel(inputs, rng_states, d_dwell, d_ribo_dwell, d_rho_dwell,
+                         d_netseq, d_flux_dummy, compute_flux=0, stream=stream)
 
+    # Launch MSE kernel (one block per candidate, 256 threads per block)
+    mse_args = (d_netseq, d_S_exp, d_mse,
+                np.int32(n_runs), np.int32(gene_length), np.int32(n_candidates))
     if stream is not None:
-        _tasep_core_cuda[blocks, threads_per_block, stream](*kernel_args)
+        _compute_mse_cuda[n_candidates, 256, stream](*mse_args)
     else:
-        _tasep_core_cuda[blocks, threads_per_block](*kernel_args)
+        _compute_mse_cuda[n_candidates, 256](*mse_args)
 
-    # Copy results back
-    h_netseq = d_netseq.copy_to_host(stream=stream)
+    # Only transfer MSE values to host (~100 bytes)
+    h_mse = d_mse.copy_to_host(stream=stream)
 
     if stream is not None:
         stream.synchronize()
     else:
         cuda.synchronize()
 
-    # Aggregate per candidate: average NETseq_sum across runs, compute MSE
-    n_runs_actual = inputs["n_runs"]
-    fitnesses = []
-    for c_idx in range(n_candidates):
-        start = c_idx * n_runs_actual
-        end = start + n_runs_actual
-        netseq_avg = np.mean(h_netseq[start:end], axis=0)
-        s_mean = np.mean(netseq_avg)
-        if s_mean > 0:
-            s_norm = netseq_avg / s_mean
-            mse = float(np.mean((S_exp_norm - s_norm) ** 2))
-        else:
-            mse = 1e6
-        fitnesses.append(mse)
+    return h_mse.tolist()
 
-    return fitnesses
 
+# ---------------------------------------------------------------------------
+# Host-side: simulate_with_flux_gpu (post-CMA-ES analysis)
+# ---------------------------------------------------------------------------
+
+def simulate_with_flux_gpu(thetas, base_params, n_runs, base_seed=0,
+                           device_id=0, stream=None):
+    """
+    Run simulation with flux computation enabled.
+
+    Use after CMA-ES converges: run a final batch with the optimized D* to
+    get both NETseq and flux profiles for analysis/visualization.
+
+    Returns:
+        (h_netseq, h_flux) — both (n_candidates, gene_length) arrays
+        h_netseq: float32 summed NETseq counts across runs (divide by n_runs for avg)
+        h_flux: int32 summed flux counts across runs (divide by n_runs for avg)
+    """
+    if not _CUDA_AVAILABLE:
+        raise RuntimeError("CUDA not available")
+
+    inputs = _prepare_kernel_inputs(thetas, base_params, n_runs)
+    n_total = inputs["n_total"]
+    gene_length = inputs["gene_length"]
+    n_candidates = inputs["n_candidates"]
+
+    cuda.select_device(device_id)
+    rng_states = create_xoroshiro128p_states(n_total, seed=base_seed)
+
+    d_dwell = cuda.to_device(inputs["dwell_profiles"], stream=stream)
+    d_ribo_dwell = cuda.to_device(inputs["ribo_dwell_profiles"], stream=stream)
+    d_rho_dwell = cuda.to_device(inputs["rho_dwell_profiles"], stream=stream)
+
+    d_netseq = cuda.to_device(
+        np.zeros((n_candidates, gene_length), dtype=np.float32), stream=stream)
+    d_flux = cuda.to_device(
+        np.zeros((n_candidates, gene_length), dtype=np.int32), stream=stream)
+
+    # Launch TASEP kernel (compute_flux=1)
+    _launch_tasep_kernel(inputs, rng_states, d_dwell, d_ribo_dwell, d_rho_dwell,
+                         d_netseq, d_flux, compute_flux=1, stream=stream)
+
+    h_netseq = d_netseq.copy_to_host(stream=stream)
+    h_flux = d_flux.copy_to_host(stream=stream)
+
+    if stream is not None:
+        stream.synchronize()
+    else:
+        cuda.synchronize()
+
+    return h_netseq, h_flux
+
+
+# ---------------------------------------------------------------------------
+# CPU fallback
+# ---------------------------------------------------------------------------
 
 def _objective_batch_cpu_fallback(thetas, base_params, n_runs, S_exp_norm, base_seed):
     """CPU fallback using ThreadPoolExecutor (same as notebook objective_batch)."""
