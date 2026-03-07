@@ -113,9 +113,9 @@ if _CUDA_AVAILABLE:
         rng_states,
         # Per-candidate dwell profiles: (n_total_sims, gene_length+1) in global mem
         dwell_profiles,
-        # Per-candidate ribo dwell: (n_total_sims, gene_length+1)
+        # Shared ribo dwell: (gene_length+1,) — identical for all sims
         ribo_dwell_profiles,
-        # Per-candidate rho dwell: (n_total_sims, gene_length+1)
+        # Shared rho dwell: (gene_length+1,) — identical for all sims
         rho_dwell_profiles,
         # Scalar params broadcast to all threads (1-D arrays of length n_total_sims)
         gene_lengths,
@@ -158,10 +158,10 @@ if _CUDA_AVAILABLE:
         big_t = float(simtime) + 1.0
 
         # -- Thread-local arrays --
-        # Size 256: fits history_cap for all E. coli genes
-        # (k_loading=0.05 * simtime=2000 * 2 + 32 = 232, rounded up)
+        # Size 128: fits history_cap for all E. coli genes
+        # (k_loading=0.05 * simtime=2000 * 1.2 = 120, rounded up with margin)
         # NO recycling — mirrors CPU's append-only arrays with sentinels
-        HIST_CAP = 256
+        HIST_CAP = 128
         rnap_locs = cuda.local.array(HIST_CAP, dtype=np.int64)
         ribo_locs = cuda.local.array(HIST_CAP, dtype=np.int64)
         rho_locs = cuda.local.array(HIST_CAP, dtype=np.int64)
@@ -326,7 +326,7 @@ if _CUDA_AVAILABLE:
                         end_loc = gene_length
                     rho_advance = _sample_first_passage_cuda(
                         rng_states, tid,
-                        rho_dwell_profiles[tid],
+                        rho_dwell_profiles,
                         rho_loc, end_loc, t_now, dt, exit_buf,
                     )
                     rho_locs[idx] = rho_loc + rho_advance
@@ -371,7 +371,7 @@ if _CUDA_AVAILABLE:
                             end_loc = gene_length
                         ribo_advance = _sample_first_passage_cuda(
                             rng_states, tid,
-                            ribo_dwell_profiles[tid],
+                            ribo_dwell_profiles,
                             ribo_loc, end_loc, t_now, dt, exit_buf,
                         )
 
@@ -449,14 +449,13 @@ def _prepare_kernel_inputs(thetas, base_params, n_runs):
 
     # Build dwell profiles per simulation
     dwell_all = np.zeros((n_total, gene_length + 1), dtype=np.float64)
-    ribo_dwell_all = np.zeros((n_total, gene_length + 1), dtype=np.float64)
-    rho_dwell_all = np.zeros((n_total, gene_length + 1), dtype=np.float64)
 
-    ribo_dwell_row = np.zeros(gene_length + 1, dtype=np.float64)
-    ribo_dwell_row[1:] = dx / ribo_speed
-    rho_dwell_row = np.zeros(gene_length + 1, dtype=np.float64)
+    # ribo/rho dwell are identical for all sims — store as single 1D row
+    ribo_dwell_all = np.zeros(gene_length + 1, dtype=np.float64)
+    ribo_dwell_all[1:] = dx / ribo_speed
+    rho_dwell_all = np.zeros(gene_length + 1, dtype=np.float64)
     if rut_speed > 0:
-        rho_dwell_row[1:] = dx / rut_speed
+        rho_dwell_all[1:] = dx / rut_speed
 
     for c_idx, theta in enumerate(thetas):
         D = np.exp(theta)
@@ -466,8 +465,6 @@ def _prepare_kernel_inputs(thetas, base_params, n_runs):
         for r_idx in range(n_runs):
             sim_idx = c_idx * n_runs + r_idx
             dwell_all[sim_idx] = row
-            ribo_dwell_all[sim_idx] = ribo_dwell_row
-            rho_dwell_all[sim_idx] = rho_dwell_row
 
     # Scalar param arrays
     gene_lengths = np.full(n_total, gene_length, dtype=np.int64)
@@ -550,7 +547,7 @@ def objective_batch_gpu(thetas, base_params, n_runs, S_exp_norm,
     d_flux = cuda.to_device(np.zeros((n_total, gene_length), dtype=np.int64), stream=stream)
 
     # Launch kernel
-    threads_per_block = 64
+    threads_per_block = 128
     blocks = (n_total + threads_per_block - 1) // threads_per_block
 
     kernel_args = (
@@ -559,7 +556,7 @@ def objective_batch_gpu(thetas, base_params, n_runs, S_exp_norm,
         d_gene_lengths, d_k_loadings, d_k_ribo_loadings, d_pt_percents,
         d_simtimes, d_glutimes, d_active_caps,
         d_netseq, d_flux,
-        gene_length, 256,  # max_history_cap matches HIST_CAP in kernel
+        gene_length, 128,  # max_history_cap matches HIST_CAP in kernel
         inputs["rnap_width"], inputs["dt"],
         inputs["min_rho_load_rna"],
         inputs["bases_rnap"], inputs["bases_ribo"], inputs["rho_window"],

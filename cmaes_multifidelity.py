@@ -4,7 +4,7 @@ cmaes_multifidelity.py
 Multi-fidelity CMA-ES optimizer for TASEP deconvolution.
 
 Features:
-  - Warm-start from analytical flux correction (Eq. M3)
+  - Direct initialization from experimental signal (D_init = S_exp)
   - GPU-aware N_RUNS schedule (200/400/600 based on sigma)
   - Adaptive early stopping on convergence plateau
   - GPU or CPU dispatch via netseq_tasep_gpu.objective_batch_gpu
@@ -25,64 +25,18 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Analytical flux model (Eq. M3)
-# ---------------------------------------------------------------------------
-
-def j_analytical(x, KRutLoading, gene_length, ell_0=85):
-    """
-    Gaussian flux model j(x) = exp(-KRutLoading / (2L) * max(0, x - ell_0)^2).
-
-    Parameters
-    ----------
-    x : array-like, positions (1-indexed)
-    KRutLoading : float, Rho loading scaling factor
-    gene_length : int
-    ell_0 : int, offset = RNAP_width(35) + minRholoadRNA(50) = 85
-
-    Returns
-    -------
-    j : array of same shape as x, normalized so j(1) ~ 1
-    """
-    x = np.asarray(x, dtype=float)
-    if KRutLoading <= 0:
-        return np.ones_like(x)
-    dx = np.maximum(x - ell_0, 0.0)
-    return np.exp(-KRutLoading / (2.0 * gene_length) * dx ** 2)
-
-
-# ---------------------------------------------------------------------------
-# Warm-start initialization
-# ---------------------------------------------------------------------------
-
-def warm_start_theta(S_exp_norm, KRutLoading, gene_length):
-    """
-    Compute theta_init = log(S_exp_norm / j_analytical).
-
-    When KRutLoading=0, j=1 everywhere and this reduces to log(S_exp_norm).
-    """
-    x = np.arange(1, gene_length + 1, dtype=float)
-    j = j_analytical(x, KRutLoading, gene_length)
-    # Guard against division by zero or very small j
-    j_safe = np.maximum(j, 1e-10)
-    D_init = S_exp_norm / j_safe
-    # Ensure positivity
-    D_init = np.maximum(D_init, 1e-10)
-    return np.log(D_init)
-
-
-# ---------------------------------------------------------------------------
 # GPU-aware N_RUNS scheduler
 # ---------------------------------------------------------------------------
 
 @dataclass
 class NRunsSchedule:
     """Multi-fidelity N_RUNS schedule based on sigma."""
-    n_runs_low: int = 200
-    n_runs_med: int = 400
-    n_runs_high: int = 600
-    sigma_thresh_med: float = 0.5   # fraction of sigma0
-    sigma_thresh_high: float = 0.25  # fraction of sigma0
-    max_threads_per_gene: int = 15000
+    n_runs_low: int = 400
+    n_runs_med: int = 800
+    n_runs_high: int = 1600
+    sigma_thresh_med: float = 0.8   # fraction of sigma0
+    sigma_thresh_high: float = 0.6  # fraction of sigma0
+    max_threads_per_gene: int = 60000
 
     def get_n_runs(self, sigma, sigma0, popsize):
         """Return N_RUNS for current sigma."""
@@ -105,7 +59,7 @@ class NRunsSchedule:
 @dataclass
 class EarlyStopping:
     """Stop if relative improvement < threshold over a window of generations."""
-    window: int = 50
+    window: int = 30
     rel_threshold: float = 0.005  # 0.5%
 
     def should_stop(self, f_best_history):
@@ -129,7 +83,7 @@ class CMAESConfig:
     max_generations: int = 500
     popsize: int | None = None
     cma_seed: int = 42
-    use_warm_start: bool = True
+    use_warm_start: bool = False
     n_runs_schedule: NRunsSchedule = field(default_factory=NRunsSchedule)
     early_stopping: EarlyStopping = field(default_factory=EarlyStopping)
     checkpoint_every: int = 25
@@ -186,11 +140,8 @@ def run_cmaes_for_gene(
     gene_length = len(S_exp_norm)
     KRutLoading = base_params["KRutLoading"]
 
-    # Initial guess
-    if config.use_warm_start:
-        theta_init = warm_start_theta(S_exp_norm, KRutLoading, gene_length)
-    else:
-        theta_init = np.log(np.maximum(S_exp_norm, 1e-10))
+    # Initial guess: direct from experimental signal
+    theta_init = np.log(np.maximum(S_exp_norm, 1e-10))
 
     # CMA-ES options
     opts = {
