@@ -4,25 +4,27 @@ run_genome_wide.py
 ==================
 Genome-wide CMA-ES deconvolution runner.
 
-Iterates over all E. coli genes in NETSEQ_gene/, runs CMA-ES deconvolution
-for each gene, and collects results into per-gene pickle files + a summary CSV.
+Uses multiprocessing (1 process per worker) to avoid GIL contention between
+GPU workers and CPU workers.
 
 Usage:
-    python run_genome_wide.py --output results/ --device gpu
-    python run_genome_wide.py --output results/ --device cpu --genes insQ,talB,aceA
-    python run_genome_wide.py --output results/ --device gpu --force --streams-per-gpu 2
+    python run_genome_wide.py --output results --gpu 2
+    python run_genome_wide.py --output results --gpu 2 --cpu-nt 16
+    python run_genome_wide.py --output results --gpu 2 --genes insQ,talB,aceA
 """
 
 import argparse
 import csv
+import math
+import multiprocessing
 import os
 import pickle
+import signal
 import sys
 import time
 import traceback
+from multiprocessing import Process, Queue as MPQueue, Value
 from pathlib import Path
-from queue import Queue
-from threading import Thread
 
 import numpy as np
 
@@ -64,38 +66,47 @@ def append_summary_row(csv_path: Path, row: dict):
         writer.writerow(row)
 
 
-def process_gene(gene_name: str, output_dir: Path, config, device_id: int, stream):
-    """Run CMA-ES for one gene and save results. Returns (gene_name, result_or_error)."""
-    from cmaes_multifidelity import run_cmaes_for_gene
-
-    result_path = gene_result_path(output_dir, gene_name)
+def _gene_length_from_csv(netseq_dir: Path, gene_name: str) -> int:
+    """Get gene length from CSV file."""
+    path = netseq_dir / f"NETSEQ_{gene_name}.csv"
     try:
-        result = run_cmaes_for_gene(
-            gene_name=gene_name,
-            config=config,
-            device_id=device_id,
-            stream=stream,
-        )
-        save_result(result_path, result)
-        return gene_name, result
-    except Exception as e:
-        error_info = {
-            "gene_name": gene_name,
-            "error": str(e),
-            "traceback": traceback.format_exc(),
-        }
-        save_result(gene_failed_path(output_dir, gene_name), error_info)
-        return gene_name, error_info
+        return len(np.loadtxt(path, delimiter=","))
+    except Exception:
+        return 0
 
 
-def worker_thread(gene_queue: Queue, results_list: list, output_dir: Path,
-                  config, device_id: int, stream_idx: int):
-    """Worker thread: pull genes from queue, process them."""
-    from netseq_tasep_gpu import cuda_is_available
+def worker_process(gene_queue: MPQueue, result_queue: MPQueue, output_dir: Path,
+                   config_dict: dict, device_id: int, netseq_dir: Path,
+                   gen_counter=None):
+    """Worker process: pull genes from queue, process them, send results back."""
+    from cmaes_multifidelity import CMAESConfig, NRunsSchedule, EarlyStopping, run_cmaes_for_gene
 
-    # Create a CUDA stream if GPU is available
+    device_label = f"GPU-{device_id}" if device_id >= 0 else "CPU"
+
+    # Reconstruct config in this process
+    config = CMAESConfig(
+        sigma0=config_dict["sigma0"],
+        max_generations=config_dict["max_generations"],
+        use_gpu=config_dict["use_gpu"],
+        device_id=device_id,
+        display_every=0,
+        cpu_nt=config_dict.get("cpu_nt"),
+        dt=config_dict["dt"],
+        gen_counter=gen_counter,
+        n_runs_schedule=NRunsSchedule(
+            n_runs_low=config_dict["n_runs"],
+            n_runs_med=config_dict["n_runs"],
+            n_runs_high=config_dict["n_runs"],
+        ),
+        early_stopping=EarlyStopping(
+            window=config_dict["early_stop_window"],
+            rel_threshold=config_dict["early_stop_threshold"],
+        ),
+    )
+
+    # Create CUDA stream if GPU worker
     stream = None
-    if config.use_gpu and cuda_is_available():
+    if config.use_gpu and device_id >= 0:
         from numba import cuda
         cuda.select_device(device_id)
         stream = cuda.stream()
@@ -103,24 +114,103 @@ def worker_thread(gene_queue: Queue, results_list: list, output_dir: Path,
     while True:
         item = gene_queue.get()
         if item is None:  # poison pill
-            gene_queue.task_done()
             break
+
         gene_idx, gene_name, total = item
+
+        # Get gene length for display
+        gene_len = _gene_length_from_csv(netseq_dir, gene_name)
+        popsize = int(4 + 3 * math.log(gene_len)) if gene_len > 0 else 0
+        n_runs = config_dict["n_runs"]
+        n_threads = popsize * n_runs
+
+        print(f"[{device_label}] Starting {gene_name} ({gene_idx+1}/{total}, "
+              f"{gene_len} bp, popsize={popsize}, {n_threads} threads)", flush=True)
+
         t0 = time.time()
-        gene_name, result = process_gene(gene_name, output_dir, config, device_id, stream)
-        elapsed = time.time() - t0
-        results_list.append((gene_idx, gene_name, result, elapsed))
-        gene_queue.task_done()
+        result_path = gene_result_path(output_dir, gene_name)
+
+        try:
+            result = run_cmaes_for_gene(
+                gene_name=gene_name,
+                config=config,
+                device_id=device_id,
+                stream=stream,
+            )
+            save_result(result_path, result)
+
+            mse = result["final_mse"]
+            rms = result["final_rms"]
+            gens = result["generations"]
+            naive_mse = result["history"]["f_best"][0] if result["history"]["f_best"] else mse
+            improvement = (naive_mse - mse) / naive_mse * 100 if naive_mse > 0 else 0.0
+            elapsed = time.time() - t0
+
+            print(f"[{device_label}] Finished {gene_name}: MSE={mse:.2f} "
+                  f"(\u2193{improvement:.1f}% from naive), RMS={rms:.2f}, "
+                  f"{gens} gens, {elapsed:.1f}s \u2192 saved", flush=True)
+
+            # Send summary back to main process
+            result_queue.put({
+                "gene_name": gene_name,
+                "gene_idx": gene_idx,
+                "gene_length": result["gene_length"],
+                "KRutLoading": result["KRutLoading"],
+                "kRiboLoading": result["kRiboLoading"],
+                "final_mse": mse,
+                "final_rms": rms,
+                "generations": gens,
+                "early_stopped": result["early_stopped"],
+                "wall_time": result["wall_time"],
+                "elapsed": elapsed,
+                "device": device_label,
+                "status": "ok",
+            })
+
+        except Exception as e:
+            elapsed = time.time() - t0
+            error_info = {
+                "gene_name": gene_name,
+                "error": str(e),
+                "traceback": traceback.format_exc(),
+            }
+            save_result(gene_failed_path(output_dir, gene_name), error_info)
+            print(f"[{device_label}] FAILED {gene_name}: {e}", flush=True)
+            result_queue.put({
+                "gene_name": gene_name,
+                "gene_idx": gene_idx,
+                "elapsed": elapsed,
+                "device": device_label,
+                "status": "failed",
+                "error": str(e),
+            })
+
+
+def _check_cuda():
+    """Check CUDA availability without polluting the main process CUDA state."""
+    try:
+        import subprocess
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "from numba import cuda; print(cuda.is_available()); print(len(cuda.gpus))"],
+            capture_output=True, text=True, timeout=30,
+        )
+        lines = result.stdout.strip().split("\n")
+        available = lines[0].strip() == "True"
+        count = int(lines[1].strip()) if available else 0
+        return available, count
+    except Exception:
+        return False, 0
 
 
 def run_genome_wide(args):
-    from cmaes_multifidelity import CMAESConfig, NRunsSchedule, EarlyStopping
-    from netseq_tasep_gpu import cuda_is_available, gpu_count
+    cuda_available, n_cuda_gpus = _check_cuda()
 
     script_dir = Path(__file__).resolve().parent
     netseq_dir = script_dir / "NETSEQ_gene"
     output_dir = Path(args.output)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    cmaes_dir = output_dir / "cmaes"
+    cmaes_dir.mkdir(parents=True, exist_ok=True)
 
     summary_csv = output_dir / "genome_wide_summary.csv"
 
@@ -134,11 +224,11 @@ def run_genome_wide(args):
         print("No genes found.")
         return
 
-    # Resume: skip genes with existing results
+    # Resume: skip genes with existing results in cmaes/ subdirectory
     if not args.force:
         already_done = set()
         for g in genes:
-            if gene_result_path(output_dir, g).exists():
+            if gene_result_path(cmaes_dir, g).exists():
                 already_done.add(g)
         if already_done:
             print(f"Resuming: skipping {len(already_done)} already-completed genes")
@@ -148,8 +238,7 @@ def run_genome_wide(args):
         print("All genes already processed. Use --force to re-run.")
         return
 
-    # Sort genes by length (descending) to process longest first,
-    # avoiding stragglers at the end when most workers are idle.
+    # Sort genes by length (descending) to process longest first
     def _csv_line_count(path):
         try:
             with open(path) as f:
@@ -163,29 +252,63 @@ def run_genome_wide(args):
     )
 
     total = len(genes)
-    print(f"Processing {total} genes → {output_dir}")
-
-    # Config
-    use_gpu = args.device == "gpu" and cuda_is_available()
-    if args.device == "gpu" and not cuda_is_available():
-        print("Warning: GPU requested but CUDA not available. Falling back to CPU.")
-
-    config = CMAESConfig(
-        use_gpu=use_gpu,
-        n_runs_schedule=NRunsSchedule(),
-        early_stopping=EarlyStopping(),
-    )
 
     # Determine parallelism
-    n_gpus = min(args.n_gpus, gpu_count()) if use_gpu else 0
-    streams_per_gpu = args.streams_per_gpu if use_gpu else 1
-    n_workers = max(1, n_gpus * streams_per_gpu) if use_gpu else 1
+    n_gpus = min(args.gpu, n_cuda_gpus) if args.gpu > 0 else 0
+    if args.gpu > 0 and not cuda_available:
+        print("Warning: --gpu requested but CUDA not available. Falling back to CPU.")
+        n_gpus = 0
+    cpu_nt = args.cpu_nt
+    n_cpu_workers = 1 if cpu_nt > 0 else 0
+    # If no GPU and no CPU workers, create 1 CPU fallback worker
+    if n_gpus == 0 and n_cpu_workers == 0:
+        n_cpu_workers = 1
+        if cpu_nt == 0:
+            cpu_nt = os.cpu_count() or 1
+    n_workers = n_gpus + n_cpu_workers
 
-    print(f"Device: {'GPU' if use_gpu else 'CPU'}, GPUs: {n_gpus}, "
-          f"Streams/GPU: {streams_per_gpu}, Workers: {n_workers}")
+    n_runs = 200  # uniform schedule
 
-    # Build work queue
-    gene_queue = Queue()
+    # Config dict (picklable, sent to worker processes)
+    config_dict = {
+        "sigma0": 0.1,
+        "max_generations": args.max_gens,
+        "use_gpu": True,
+        "dt": 0.2,
+        "n_runs": n_runs,
+        "early_stop_window": 30,
+        "early_stop_threshold": 0.005,
+        "cpu_nt": None,
+    }
+
+    # Config summary
+    print("=== Genome-wide CMA-ES Deconvolution ===")
+    print(f"Output:       {cmaes_dir}")
+    print(f"dt:           {config_dict['dt']}")
+    print(f"n_runs:       {n_runs}")
+    print(f"sigma0:       {config_dict['sigma0']}")
+    print(f"max_gens:     {config_dict['max_generations']}")
+    print(f"popsize:      auto (4 + 3*ln(geneLength))")
+    print(f"early_stop:   {config_dict['early_stop_window']} gens, "
+          f"{config_dict['early_stop_threshold']*100:.1f}% threshold")
+    gpu_list = ", ".join(f"GPU-{i}" for i in range(n_gpus)) if n_gpus > 0 else "none"
+    print(f"GPUs:         {n_gpus} ({gpu_list})" if n_gpus > 0 else "GPUs:         0")
+    if cpu_nt > 0:
+        print(f"CPU threads:  {cpu_nt}")
+    else:
+        print(f"CPU threads:  0")
+    print(f"Total workers: {n_workers}")
+    print()
+    print(f"Processing {total} genes \u2192 {cmaes_dir}")
+    print(flush=True)
+
+    # Shared generation counter (atomically incremented by all workers)
+    gen_counter = Value("i", 0)
+
+    # Build work queue (multiprocessing-safe)
+    gene_queue = MPQueue()
+    result_queue = MPQueue()
+
     for i, gene in enumerate(genes):
         gene_queue.put((i, gene, total))
 
@@ -193,74 +316,103 @@ def run_genome_wide(args):
     for _ in range(n_workers):
         gene_queue.put(None)
 
-    # Launch workers
-    results_list = []
-    threads = []
-    for w in range(n_workers):
-        if use_gpu:
-            dev_id = w // streams_per_gpu
-            s_idx = w % streams_per_gpu
-        else:
-            dev_id = 0
-            s_idx = 0
-        t = Thread(target=worker_thread,
-                   args=(gene_queue, results_list, output_dir, config, dev_id, s_idx))
-        t.start()
-        threads.append(t)
+    # Launch worker processes
+    processes = []
 
-    # Progress reporting
+    # GPU workers
+    for w in range(n_gpus):
+        gpu_config = dict(config_dict, use_gpu=True)
+        p = Process(
+            target=worker_process,
+            args=(gene_queue, result_queue, cmaes_dir, gpu_config, w, netseq_dir, gen_counter),
+        )
+        p.start()
+        processes.append(p)
+
+    # CPU worker
+    if n_cpu_workers > 0:
+        cpu_config = dict(config_dict, use_gpu=False, cpu_nt=cpu_nt)
+        p = Process(
+            target=worker_process,
+            args=(gene_queue, result_queue, cmaes_dir, cpu_config, -1, netseq_dir, gen_counter),
+        )
+        p.start()
+        processes.append(p)
+
+    # Register SIGTERM handler to clean up child processes on kill
+    def _sigterm_handler(signum, frame):
+        print("\nReceived SIGTERM — terminating worker processes...", flush=True)
+        for p in processes:
+            if p.is_alive():
+                p.terminate()
+        for p in processes:
+            p.join(timeout=10)
+            if p.is_alive():
+                p.kill()
+        sys.exit(1)
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
+    # Progress reporting from main process
     t_start = time.time()
     completed = 0
     rms_sum = 0.0
+    total_gens_completed = 0  # from finished genes (for avg gens/gene)
+    last_periodic_print = t_start
 
-    while any(t.is_alive() for t in threads):
-        time.sleep(1.0)
-        # Report newly completed
-        while completed < len(results_list):
-            gene_idx, gene_name, result, elapsed = results_list[completed]
-            completed += 1
+    def _print_eta(tag=""):
+        total_elapsed = time.time() - t_start
+        gens_so_far = gen_counter.value
+        remaining_genes = total - completed
+        mean_rms = rms_sum / completed if completed > 0 else 0.0
 
-            if isinstance(result, dict) and "final_mse" in result:
-                rms = result["final_rms"]
-                mse = result["final_mse"]
-                gens = result["generations"]
-                early = result["early_stopped"]
-                rms_sum += rms
+        if gens_so_far > 0 and total_elapsed > 0:
+            gens_per_min = gens_so_far / total_elapsed * 60
+            avg_gens_per_gene = total_gens_completed / completed if completed > 0 else args.max_gens
+            remaining_gens = avg_gens_per_gene * remaining_genes
+            eta_h = remaining_gens / (gens_so_far / total_elapsed) / 3600
+            print(f"[{completed}/{total}] {gens_per_min:.0f} gens/min ({gens_so_far} gens) | "
+                  f"ETA: {eta_h:.1f}h | mean_RMS={mean_rms:.4f}", flush=True)
 
-                # Append to summary CSV
-                append_summary_row(summary_csv, {
-                    "gene": gene_name,
-                    "gene_length": result["gene_length"],
-                    "KRutLoading": result["KRutLoading"],
-                    "kRiboLoading": result["kRiboLoading"],
-                    "final_mse": f"{mse:.6f}",
-                    "final_rms": f"{rms:.4f}",
-                    "generations": gens,
-                    "early_stopped": early,
-                    "wall_time": f"{result['wall_time']:.1f}",
-                })
+    while any(p.is_alive() for p in processes) or not result_queue.empty():
+        try:
+            result = result_queue.get(timeout=1.0)
+        except Exception:
+            # No gene finished — check if we should print periodic ETA
+            now = time.time()
+            if now - last_periodic_print >= 60:
+                last_periodic_print = now
+                _print_eta()
+            continue
 
-                total_elapsed = time.time() - t_start
-                avg_time = total_elapsed / completed
-                remaining = total - completed
-                eta_s = avg_time * remaining
-                eta_h = eta_s / 3600
-                mean_rms = rms_sum / completed
+        completed += 1
 
-                print(f"[{completed}/{total}] {gene_name}: MSE={mse:.4f}, "
-                      f"RMS={rms:.4f}, {elapsed:.1f}s | "
-                      f"ETA: {eta_h:.1f}h | mean_RMS={mean_rms:.4f}")
-            else:
-                # Failed gene
-                err_msg = result.get("error", "unknown") if isinstance(result, dict) else str(result)
-                print(f"[{completed}/{total}] {gene_name}: FAILED - {err_msg}")
+        if result["status"] == "ok":
+            rms_sum += result["final_rms"]
+            total_gens_completed += result["generations"]
 
-    for t in threads:
-        t.join()
+            # Append to summary CSV
+            append_summary_row(summary_csv, {
+                "gene": result["gene_name"],
+                "gene_length": result["gene_length"],
+                "KRutLoading": result["KRutLoading"],
+                "kRiboLoading": result["kRiboLoading"],
+                "final_mse": f"{result['final_mse']:.6f}",
+                "final_rms": f"{result['final_rms']:.4f}",
+                "generations": result["generations"],
+                "early_stopped": result["early_stopped"],
+                "wall_time": f"{result['wall_time']:.1f}",
+            })
+
+        _print_eta()
+        last_periodic_print = time.time()
+
+    for p in processes:
+        p.join()
 
     total_time = time.time() - t_start
     print(f"\nDone. {completed} genes in {total_time:.1f}s ({total_time/3600:.2f}h)")
-    print(f"Results: {output_dir}")
+    print(f"Results: {cmaes_dir}")
     print(f"Summary: {summary_csv}")
 
 
@@ -268,19 +420,20 @@ def main():
     parser = argparse.ArgumentParser(description="Genome-wide CMA-ES deconvolution")
     parser.add_argument("--output", type=str, default="results",
                         help="Output directory for results (default: results/)")
-    parser.add_argument("--device", choices=["gpu", "cpu"], default="gpu",
-                        help="Computation device (default: gpu)")
+    parser.add_argument("--gpu", type=int, default=0,
+                        help="Number of GPUs to use (default: 0)")
+    parser.add_argument("--cpu-nt", type=int, default=0,
+                        help="Number of CPU threads for hybrid mode (default: 0, creates 1 CPU worker using N threads)")
+    parser.add_argument("--max-gens", type=int, default=500,
+                        help="Maximum CMA-ES generations per gene (default: 500)")
     parser.add_argument("--genes", type=str, default=None,
                         help="Comma-separated gene names to process (default: all)")
     parser.add_argument("--force", action="store_true",
                         help="Force re-processing of already-completed genes")
-    parser.add_argument("--n-gpus", type=int, default=99,
-                        help="Max GPUs to use (default: all available)")
-    parser.add_argument("--streams-per-gpu", type=int, default=1,
-                        help="CUDA streams per GPU (default: 1, concurrent streams don't improve throughput)")
     args = parser.parse_args()
     run_genome_wide(args)
 
 
 if __name__ == "__main__":
+    multiprocessing.set_start_method("spawn", force=True)
     main()

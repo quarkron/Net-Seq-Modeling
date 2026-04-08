@@ -133,7 +133,7 @@ if _CUDA_AVAILABLE:
         compute_flux,     # int32: 0=skip flux, 1=compute flux
         # Scalar physical params (shared by all threads)
         k_loading,        # float32
-        k_ribo_loading,   # float32
+        k_ribo_loading_arr,  # (n_candidates,) float32 — per-candidate
         pt_percent,       # float32
         simtime,          # int32
         glutime,          # float32
@@ -151,6 +151,7 @@ if _CUDA_AVAILABLE:
             return
 
         candidate_idx = tid // n_runs
+        k_ribo_loading = k_ribo_loading_arr[candidate_idx]
 
         # Sentinels (identical to CPU)
         term_rnap = gene_length + 10
@@ -479,8 +480,13 @@ if _CUDA_AVAILABLE:
 # Host-side helpers
 # ---------------------------------------------------------------------------
 
-def _prepare_kernel_inputs(thetas, base_params, n_runs):
-    """Build deduplicated arrays and scalar params for the GPU kernel."""
+def _prepare_kernel_inputs(thetas, base_params, n_runs, k_ribo_loadings=None):
+    """Build deduplicated arrays and scalar params for the GPU kernel.
+
+    Args:
+        k_ribo_loadings: optional per-candidate array of kRiboLoading values.
+            If None, broadcasts base_params["kRiboLoading"] to all candidates.
+    """
     from netseq_tasep_fast import _estimate_caps
 
     n_candidates = len(thetas)
@@ -492,12 +498,17 @@ def _prepare_kernel_inputs(thetas, base_params, n_runs):
     rnap_speed = float(base_params.get("RNAPSpeed", 19))
     ribo_speed = float(base_params.get("ribospeed", 19))
     k_loading = float(base_params.get("kLoading", 1 / 20))
-    k_ribo_loading = float(base_params.get("kRiboLoading", 0))
     pt_percent = float(base_params.get("KRutLoading", 0.13))
+
+    # Per-candidate k_ribo_loading array
+    if k_ribo_loadings is not None:
+        k_ribo_arr = np.asarray(k_ribo_loadings, dtype=np.float32)
+    else:
+        k_ribo_arr = np.full(n_candidates, base_params.get("kRiboLoading", 0), dtype=np.float32)
     simtime = int(base_params.get("simtime", 2000))
     glutime = float(base_params.get("glutime", 1600))
     dx = 1.0
-    dt = 0.1
+    dt = float(base_params.get("dt", 0.1))
     rnap_width = 35
     rut_speed = 5 * ribo_speed
     min_rho_load_rna = 50
@@ -531,7 +542,7 @@ def _prepare_kernel_inputs(thetas, base_params, n_runs):
         "n_runs": n_runs,
         # Scalar params (typed for kernel)
         "k_loading": np.float32(k_loading),
-        "k_ribo_loading": np.float32(k_ribo_loading),
+        "k_ribo_loading_arr": k_ribo_arr,
         "pt_percent": np.float32(pt_percent),
         "simtime": np.int32(simtime),
         "glutime": np.float32(glutime),
@@ -551,13 +562,15 @@ def _launch_tasep_kernel(inputs, rng_states, d_dwell, d_ribo_dwell, d_rho_dwell,
     threads_per_block = 128
     blocks = (n_total + threads_per_block - 1) // threads_per_block
 
+    d_k_ribo = cuda.to_device(inputs["k_ribo_loading_arr"], stream=stream)
+
     kernel_args = (
         rng_states,
         d_dwell, d_ribo_dwell, d_rho_dwell,
         d_netseq, d_flux,
         np.int32(inputs["n_runs"]), np.int32(inputs["gene_length"]),
         np.int32(compute_flux),
-        inputs["k_loading"], inputs["k_ribo_loading"], inputs["pt_percent"],
+        inputs["k_loading"], d_k_ribo, inputs["pt_percent"],
         inputs["simtime"], inputs["glutime"],
         inputs["rnap_width"], inputs["dt"], inputs["min_rho_load_rna"],
         inputs["bases_rnap"], inputs["bases_ribo"], inputs["rho_window"],
@@ -574,7 +587,8 @@ def _launch_tasep_kernel(inputs, rng_states, d_dwell, d_ribo_dwell, d_rho_dwell,
 # ---------------------------------------------------------------------------
 
 def objective_batch_gpu(thetas, base_params, n_runs, S_exp_norm,
-                        base_seed=0, device_id=0, stream=None):
+                        base_seed=0, device_id=0, stream=None, use_crn=False,
+                        cpu_nt=None):
     """
     GPU-accelerated batch evaluation of CMA-ES candidates.
 
@@ -588,12 +602,15 @@ def objective_batch_gpu(thetas, base_params, n_runs, S_exp_norm,
         base_seed: RNG seed base
         device_id: which GPU to use
         stream: CUDA stream (None = default stream)
+        use_crn: if True, use Common Random Numbers — run r of every
+                 candidate shares the same RNG seed, so fitness differences
+                 reflect only dwell-profile differences, not stochastic noise.
 
     Returns:
         List of MSE values, one per candidate
     """
-    if not _CUDA_AVAILABLE:
-        return _objective_batch_cpu_fallback(thetas, base_params, n_runs, S_exp_norm, base_seed)
+    if not _CUDA_AVAILABLE or device_id < 0:
+        return _objective_batch_cpu_fallback(thetas, base_params, n_runs, S_exp_norm, base_seed, use_crn=use_crn, cpu_nt=cpu_nt)
 
     inputs = _prepare_kernel_inputs(thetas, base_params, n_runs)
     n_total = inputs["n_total"]
@@ -604,7 +621,14 @@ def objective_batch_gpu(thetas, base_params, n_runs, S_exp_norm,
     cuda.select_device(device_id)
 
     # Allocate RNG states
-    rng_states = create_xoroshiro128p_states(n_total, seed=base_seed)
+    if use_crn:
+        # CRN: create n_runs base states, tile so run r of every candidate
+        # shares the same RNG stream.  Thread layout: tid = cand * n_runs + run.
+        base_rng = create_xoroshiro128p_states(n_runs, seed=base_seed)
+        h_base = base_rng.copy_to_host()
+        rng_states = cuda.to_device(np.tile(h_base, n_candidates), stream=stream)
+    else:
+        rng_states = create_xoroshiro128p_states(n_total, seed=base_seed)
 
     # Transfer dwell profiles to device
     d_dwell = cuda.to_device(inputs["dwell_profiles"], stream=stream)
@@ -651,12 +675,16 @@ def objective_batch_gpu(thetas, base_params, n_runs, S_exp_norm,
 # ---------------------------------------------------------------------------
 
 def simulate_with_flux_gpu(thetas, base_params, n_runs, base_seed=0,
-                           device_id=0, stream=None):
+                           device_id=0, stream=None, k_ribo_loadings=None):
     """
     Run simulation with flux computation enabled.
 
     Use after CMA-ES converges: run a final batch with the optimized D* to
     get both NETseq and flux profiles for analysis/visualization.
+
+    Args:
+        k_ribo_loadings: optional per-candidate kRiboLoading array for
+            batching genes with different ribosome loading rates.
 
     Returns:
         (h_netseq, h_flux) — both (n_candidates, gene_length) arrays
@@ -666,7 +694,8 @@ def simulate_with_flux_gpu(thetas, base_params, n_runs, base_seed=0,
     if not _CUDA_AVAILABLE:
         raise RuntimeError("CUDA not available")
 
-    inputs = _prepare_kernel_inputs(thetas, base_params, n_runs)
+    inputs = _prepare_kernel_inputs(thetas, base_params, n_runs,
+                                    k_ribo_loadings=k_ribo_loadings)
     n_total = inputs["n_total"]
     gene_length = inputs["gene_length"]
     n_candidates = inputs["n_candidates"]
@@ -702,13 +731,13 @@ def simulate_with_flux_gpu(thetas, base_params, n_runs, base_seed=0,
 # CPU fallback
 # ---------------------------------------------------------------------------
 
-def _objective_batch_cpu_fallback(thetas, base_params, n_runs, S_exp_norm, base_seed):
+def _objective_batch_cpu_fallback(thetas, base_params, n_runs, S_exp_norm, base_seed, use_crn=False, cpu_nt=None):
     """CPU fallback using ThreadPoolExecutor (same as notebook objective_batch)."""
     from netseq_tasep_fast import netseq_tasep_fast
 
     n_candidates = len(thetas)
     gene_length = len(thetas[0])
-    n_workers = os.cpu_count() or 1
+    n_workers = cpu_nt if cpu_nt and cpu_nt > 0 else (os.cpu_count() or 1)
 
     def run_single(args):
         cand_idx, dwell_profile, seed = args
@@ -725,7 +754,10 @@ def _objective_batch_cpu_fallback(thetas, base_params, n_runs, S_exp_norm, base_
     args_list = []
     for c_idx, D_norm in enumerate(D_norms):
         for r_idx in range(n_runs):
-            seed = base_seed + c_idx * n_runs + r_idx
+            if use_crn:
+                seed = base_seed + r_idx
+            else:
+                seed = base_seed + c_idx * n_runs + r_idx
             args_list.append((c_idx, D_norm, seed))
 
     with ThreadPoolExecutor(max_workers=n_workers) as executor:

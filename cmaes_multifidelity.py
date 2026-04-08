@@ -32,8 +32,8 @@ except ImportError:
 class NRunsSchedule:
     """Multi-fidelity N_RUNS schedule based on sigma."""
     n_runs_low: int = 200
-    n_runs_med: int = 400
-    n_runs_high: int = 800
+    n_runs_med: int = 200
+    n_runs_high: int = 200
     sigma_thresh_med: float = 0.8   # fraction of sigma0
     sigma_thresh_high: float = 0.6  # fraction of sigma0
     max_threads_per_gene: int = 60000
@@ -89,9 +89,13 @@ class CMAESConfig:
     checkpoint_every: int = 25
     checkpoint_dir: str | None = None
     display_every: int = 1
+    dt: float = 0.2
     use_gpu: bool = True
     device_id: int = 0
     stream: object = None
+    use_crn: bool = False
+    cpu_nt: int | None = None
+    gen_counter: object = None  # multiprocessing.Value for shared generation tracking
 
 
 # ---------------------------------------------------------------------------
@@ -134,8 +138,9 @@ def run_cmaes_for_gene(
     if stream is not None:
         config.stream = stream
 
-    # Load gene data
+    # Load gene data and inject dt
     base_params = _load_gene_parameters(gene_name)
+    base_params["dt"] = config.dt
     S_exp_norm = base_params["RNAP_dwellTimeProfile"].copy()
     gene_length = len(S_exp_norm)
     KRutLoading = base_params["KRutLoading"]
@@ -198,12 +203,19 @@ def run_cmaes_for_gene(
             base_seed=batch_seed,
             device_id=config.device_id,
             stream=config.stream,
+            use_crn=config.use_crn,
+            cpu_nt=config.cpu_nt,
         )
         batch_seed += len(candidates) * n_runs
 
         es.tell(candidates, fitnesses)
         gen_count += 1
         elapsed = time.time() - t_start
+
+        # Increment shared generation counter (for ETA in genome-wide runner)
+        if config.gen_counter is not None:
+            with config.gen_counter.get_lock():
+                config.gen_counter.value += 1
 
         history["gen"].append(gen_count)
         history["f_best"].append(es.result.fbest)

@@ -1,0 +1,26 @@
+__pycache__/
+.claude/
+openspec/
+ARCHITECTURE.md
+HANDOFF.md
+
+# Large result directories (pkl files)
+cmaes_checkpoints/
+cmaes_checkpoints_gpu/
+results/cmaes/
+results/flux/
+ecoli/cmaes/
+ecoli/flux/
+
+# Unused/deprecated scripts
+spline_basis.py
+spline_cmaes_prototype.ipynb
+validate_gpu_cpu.py
+warmstart_clustering.ipynb
+run_with_cooldown.sh
+
+# Logs
+*.log
+
+# PDFs
+*.pdf

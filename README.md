@@ -117,9 +117,101 @@ A wrapper script that:
 | `Ecoli_gene_TE.csv` | CSV with columns `Gene`, `mRNALevelRPKM`, `TranslationEfficiencyAU`. Provides per-gene ribosome loading rates. |
 | `NETSEQ_gene/NETSEQ_<gene>.csv` | Gene-specific CSV containing a numeric vector of RNAP dwell-time weights along the gene, used as the position-dependent transcription speed profile. |
 
-## Output
+## Output (MATLAB)
 
 The script does not write output files. Results are:
 
 - A MATLAB figure plotting summed NET-seq signal (RNAP density vs. gene position).
 - Workspace variables (`final_output.NETseq`, `NETseqSum`) available for further analysis.
+
+## Genome-wide CMA-ES Deconvolution
+
+`run_genome_wide.py` runs CMA-ES optimization across all *E. coli* genes to deconvolve RNAP dwell-time profiles from NET-seq data. It uses the GPU-accelerated TASEP kernel for evaluation.
+
+### Usage
+
+```bash
+# All genes on 2 GPUs
+python run_genome_wide.py --output results --gpu 2
+
+# Specific genes only
+python run_genome_wide.py --output results --gpu 2 --genes insQ,talB,aceA
+
+# Hybrid GPU + CPU (2 GPUs + 1 CPU worker with 16 threads)
+python run_genome_wide.py --output results --gpu 2 --cpu-nt 16
+
+# Limit to 200 generations per gene
+python run_genome_wide.py --output results --gpu 2 --max-gens 200
+
+# Re-run already-completed genes
+python run_genome_wide.py --output results --gpu 2 --force
+```
+
+### CLI Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--output` | `results` | Output directory |
+| `--gpu` | `0` | Number of GPUs to use |
+| `--cpu-nt` | `0` | Number of CPU threads for hybrid mode (creates 1 CPU worker) |
+| `--max-gens` | `500` | Maximum CMA-ES generations per gene |
+| `--genes` | all | Comma-separated gene names to process |
+| `--force` | off | Re-process already-completed genes |
+
+### Output Structure
+
+```
+results/
+├── genome_wide_summary.csv      # Per-gene summary (MSE, RMS, wall time, etc.)
+├── cmaes/                       # CMA-ES optimization results
+│   ├── insQ.pkl                 # {D_best, theta_best, S_exp_norm, history, ...}
+│   ├── talB.pkl
+│   └── ...
+└── flux/                        # Flux profiles (from post-processing)
+    ├── insQ_flux.pkl            # {gene_name, gene_length, flux_norm, n_runs, dt}
+    └── ...
+```
+
+### Restart Support
+
+The script is fully restartable. Simply re-run the same command to resume:
+
+```bash
+# Same command as before — picks up where it left off
+python run_genome_wide.py --output results --gpu 2
+```
+
+- **Completed genes** are skipped: the script checks for `results/cmaes/{gene}.pkl` and skips any gene that already has a result file.
+- **Failed genes** are retried: failures are saved as `{gene}_FAILED.pkl` (not `{gene}.pkl`), so they will be re-attempted on restart.
+- **Crashed/interrupted genes** are retried: if the process is killed mid-gene, no `.pkl` is written, so the gene is automatically picked up on the next run.
+
+### Flux Post-Processing
+
+After CMA-ES completes, compute normalized flux profiles at full fidelity (dt=0.1) from the optimized dwell times. Supports both CPU and GPU backends:
+
+```bash
+# CPU mode — uses multithreaded Numba JIT (no GPU required)
+python postprocess_flux.py --results-dir results --mode cpu --cpu-nt 32
+
+# GPU mode — batches genes by gene_length for better SM utilization
+python postprocess_flux.py --results-dir results --mode gpu --gpu 2
+
+# Auto mode (default) — uses GPU if available, else CPU
+python postprocess_flux.py --results-dir results
+
+# Specific genes
+python postprocess_flux.py --results-dir results --genes insQ,talB
+
+# Re-process already-completed genes
+python postprocess_flux.py --results-dir results --force
+```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--mode` | `auto` | Backend: `cpu` (multithreaded), `gpu` (batched by gene_length), or `auto` |
+| `--cpu-nt` | all cores | Number of CPU threads for `cpu` mode |
+| `--gpu` | `1` | Number of GPUs for `gpu` mode |
+| `--genes` | all | Comma-separated gene names to process |
+| `--force` | off | Re-process already-completed genes |
+
+**CPU vs GPU performance**: CPU mode parallelizes 200 simulation runs across threads per gene with no batching constraints. GPU mode batches genes sharing the same `gene_length` into a single kernel launch to improve occupancy. On machines with many CPU cores, CPU mode can match or outperform GPU mode since the GPU kernel underutilizes SMs when batch sizes are small.
