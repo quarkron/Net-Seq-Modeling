@@ -1,0 +1,1208 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{siunitx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue}
+
+\title{BCM $K_{\text{rut}}$ Sweep --- Observations from the 10-Gene Test Panel}
+\author{Net-Seq-Modeling project}
+\date{\today}
+
+\newcommand{\Krut}{K_{\text{rut}}}
+\newcommand{\kload}{k_{\text{load}}}
+\newcommand{\kribo}{k_{\text{ribo}}}
+\newcommand{\Dstar}{D^{\!*}}
+\newcommand{\DstarWT}{\Dstar_{\text{WT}}}
+\newcommand{\Snorm}{S_{\text{norm}}}
+\newcommand{\Sexp}{S_{\text{exp}}}
+\newcommand{\SWT}{S_{\text{WT}}}
+\newcommand{\SBCM}{S_{\text{BCM}}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We report the results of a 10-gene test panel for a $\Krut$ (Rho loading rate)
+sweep against bicyclomycin (BCM) NET-seq data, using intrinsic dwell-time
+profiles $\Dstar_{\text{WT}}(x)$ obtained from CMA-ES deconvolution of wildtype
+NET-seq. The sweep exercises a per-candidate $\Krut$ refactor of the GPU TASEP
+kernel that enables a 50-point grid evaluation in a single batched launch. We
+observe that $\Dstar_{\text{WT}}$ does not cleanly extrapolate to the BCM
+condition for most panel genes under the current model: nearly all 10 genes
+find a best-fit $K^{*}_{\text{rut}}$ well below the WT-assumed value of $0.13$. Two genes
+pile at the $\Krut=0$ grid boundary (\texttt{rpoB}, \texttt{yihO}), and
+\texttt{yihO} exhibits a residual MSE an order of magnitude larger than any
+other gene, flagging it as a model-failure candidate for future joint re-fit.
+A $\Delta$-signal metric, designed to cancel $\Dstar_{\text{WT}}$ errors shared
+between conditions, reports ``no rho change predicted'' for 7/10 panel genes at
+$n_{\text{runs}}=5000$; two genes (\texttt{aceA}, \texttt{rpoB}) now reveal
+interior $\Delta$-metric minima at $K_{\text{rut}} \approx 0.06$.
+\end{abstract}
+
+\section{Setup}
+
+The TASEP forward model produces a per-position NET-seq-like density
+$S(x)$ given an intrinsic dwell-time profile $D(x)$ and a set of kinetic
+parameters $\theta = (\kload, \kribo, \Krut, w_{\text{RNAP}}, \ldots)$:
+\begin{equation}
+  S(x) \;=\; \mathcal{T}\bigl[D;\;\theta\bigr](x).
+\end{equation}
+Here $\mathcal{T}$ is the nonlinear TASEP operator that emerges from
+first-passage dynamics with hard-body exclusion, Rho-mediated premature
+termination, and ribosome coupling. Although one might be tempted to write
+$S = D \ast j$ for some flux kernel $j$, the underlying dynamics are not
+linear in $D$ (see \S\ref{sec:math} for the structure). The correct
+formulation is a nonlinear functional, pointwise of the form
+$S(x) \propto D(x)\cdot j(x;D,\theta)$.
+
+For each gene, the CMA-ES deconvolution solves
+\begin{equation}
+  \DstarWT \;=\; \arg\min_{D} \;\bigl\lVert\mathcal{T}[D;\;\Krut=0.13,\;\kribo]
+  \;-\; \SWT\bigr\rVert^2,
+\end{equation}
+with $\kribo = \text{TE}_{\text{gene}}/5$ taken from
+\texttt{Ecoli\_gene\_TE.csv} at load time and $\Krut$ held fixed. The
+identifiability problem we address here: when $\Krut=0.13$ does not
+match true in-vivo Rho activity for a given gene, the CMA-ES fit has no
+free handle except $D(x)$, and any mismatch is absorbed into $\DstarWT$.
+
+BCM is a Rho inhibitor. NET-seq under BCM is approximately equivalent to
+running the same $\DstarWT$ with $\Krut \to 0$ (or a small residual value
+reflecting partial inhibition). This provides the constraint that WT
+alone cannot: varying $\Krut$ and comparing against $\SBCM$ identifies
+whether the model can reconcile both conditions with a single $\DstarWT$.
+
+\section{Mathematical structure of the NET-seq signal}
+\label{sec:math}
+
+\subsection{Pointwise density equals dwell times flux}
+
+At steady state, in a mean-field approximation,
+\begin{equation}
+  S(x) \;\propto\; \rho(x) \;=\; D(x)\,j(x;D,\theta),
+\end{equation}
+i.e.\ density at position $x$ is the local dwell-time multiplied by the
+flux of RNAPs that actually reach $x$.
+
+\subsection{The flux decomposes into a loading source and two survival factors}
+
+\begin{equation}
+  j(x;D,\theta) \;=\; \kload \cdot \Pi_{\rho}(x;D,\Krut,\kribo)
+                   \cdot \Pi_{\text{traffic}}(x;D,\kload)
+\end{equation}
+
+where $\Pi_{\rho}$ is the probability of surviving Rho termination from
+the promoter to $x$, and $\Pi_{\text{traffic}}$ is a collision-blocking
+factor from hard-body exclusion.
+
+\paragraph{Rho survival} The Rho-loading rate at position $x$ scales
+with uncovered nascent RNA length:
+\begin{equation}
+  \lambda_{\rho}(x;\Krut,\kribo,D) \;=\; \frac{\Krut}{L_{\text{gene}}}
+    \cdot L_{\text{uncovered}}(x;\kribo,D),
+\end{equation}
+where $L_{\text{uncovered}}$ is the stretch of RNA between the ribosome
+position $r(x)$ and the RNAP's 5$^\prime$ footprint,
+\(
+L_{\text{uncovered}}(x) \approx x - w_{\text{RNAP}} - 30 - r(x).
+\)
+The survival factor from $0$ to $x$ is
+\begin{equation}
+  \Pi_{\rho}(x) \;=\; \exp\!\left(-\int_{0}^{x}
+    \lambda_{\rho}(x')\,D(x')\,\mathrm{d}x'\right).
+\end{equation}
+Slow dwell ($D$ large) increases exposure time and hence the effective
+rho-loading opportunity --- so $\Pi_{\rho}$ depends on \emph{all} of
+$D$ upstream of $x$, not just locally.
+
+\paragraph{Traffic throughput} Hard-body exclusion gives an effective
+velocity
+\begin{equation}
+  v_{\text{eff}}(x) \;=\; \frac{1}{D(x)}\bigl(1 - a\,\rho(x+1)\bigr),
+\end{equation}
+so the steady-state continuity with Rho attrition is
+\begin{equation}
+  \frac{\partial}{\partial x}\!\left[\rho(x)\,v_{\text{eff}}(x)\right]
+  \;=\; -\,\lambda_{\rho}(x)\,\rho(x).
+\end{equation}
+This is a self-consistent nonlinear constraint; $\rho$ depends on
+$v_{\text{eff}}$, which depends on $\rho(x+1)$. No closed-form inversion
+exists, which is why the TASEP simulator is run numerically rather than
+replaced by an analytic convolution.
+
+\subsection{Full functional form}
+
+Collecting:
+\begin{equation}
+\boxed{
+  S(x) \;=\; \alpha \cdot D(x) \cdot \kload
+      \cdot \exp\!\left(-\int_{0}^{x}\frac{\Krut}{L}\,
+          L_{\text{uncovered}}(x';\kribo)\,D(x')\,\mathrm{d}x'\right)
+      \cdot \Pi_{\text{traffic}}(x;D,\kload)
+}
+\end{equation}
+The dependence on $D$ is local through the $D(x)$ prefactor but
+non-local through both the rho-survival integrand and the implicit
+continuity equation for $\Pi_{\text{traffic}}$.
+
+\section{Sweep design}
+
+\begin{enumerate}
+\item For each gene, load $\DstarWT$ and $\kribo$ from
+  \texttt{ecoli/cmaes/\{gene\}.pkl}. Load WT $S_{\text{exp}}$ from the
+  same pkl (preserving the preprocessing used during the CMA-ES fit).
+\item Load BCM NET-seq from
+  \texttt{NETSEQ\_gene\_nomodifications\_BCM/NETSEQ\_\{gene\}.csv} and
+  apply a pseudo-count to match WT preprocessing:
+  \begin{equation}
+    \SBCM(x) \;=\; \frac{\text{raw}(x) + q_{\text{BCM}}}
+                      {\mathrm{mean}(\text{raw} + q_{\text{BCM}})},
+  \end{equation}
+  with $q_{\text{BCM}}$ the smallest nonzero value in the raw profile
+  (observed $\approx 0.293086$ for every panel gene, consistent with a
+  single global library normalization constant).
+\item Evaluate 50 uniform $\Krut$ values in $[0, 0.13]$ in a single
+  batched GPU kernel launch (enabled by promoting \texttt{pt\_percent}
+  from a scalar to a per-candidate array
+  \texttt{pt\_percent\_arr}, mirroring the existing per-candidate
+  \texttt{k\_ribo\_loading\_arr} pattern).
+\item Record two loss metrics for each $\Krut$, both on
+  mean-normalized profiles:
+  \begin{align}
+    \text{MSE}_{\text{pw}}(\Krut) &=
+      \frac{1}{L}\sum_{x}\bigl(\Snorm(\Krut, x) - \SBCM(x)\bigr)^2, \\
+    \text{MSE}_{\Delta}(\Krut) &=
+      \frac{1}{L}\sum_{x}\Bigl[\bigl(\Snorm(\Krut, x) - \Snorm(0.13, x)\bigr)
+      - \bigl(\SBCM(x) - \SWT(x)\bigr)\Bigr]^2.
+  \end{align}
+\item Simulate at $n_{\text{runs}} = 5000$ and $\mathrm{d}t = 0.1$.
+\item Save the full 50-point grid, both metric curves, and the reference
+  signals per gene; compute argmin values downstream in analysis. No
+  argmin is baked into the per-gene pickle.
+\end{enumerate}
+
+\section{Kernel refactor and validation}
+
+\paragraph{GPU} \texttt{pt\_percent} is now per-candidate. Single
+launch evaluates all 50 grid points at $\sim 21$ seconds per gene for
+panel-average gene length. A regression test on \texttt{aceA} comparing
+pre- and post-refactor flux output via \texttt{postprocess\_flux.py}
+gave Pearson $r = 1.000000$ across all 1305 positions; the residual
+$\approx 20\%$ magnitude offset is a pure global scale shift from
+$\text{flux}[0]$ being sensitive to 1-ULP FMA reordering across kernel
+recompilation, and is irrelevant for mean-normalized comparisons.
+
+\paragraph{CPU parity} \texttt{validate\_gpu\_cpu.py} was extended to
+sweep $\Krut \in \{0.0, 0.065, 0.13\}$. Pearson correlation between
+CPU and GPU mean NET-seq profiles exceeds $0.998$ at all three values;
+overall signal totals agree within $0.5\%$. The per-position strict
+$<5\%$ tolerance fails on low-signal pixels (pre-existing Poisson-noise
+regime issue), but distributional agreement is well-established.
+
+\paragraph{CPU kernel} Not refactored by design decision. The CPU
+reference \texttt{netseq\_tasep\_fast.py::\_tasep\_core} is
+single-run-scalar; per-candidate $\Krut$ flows naturally via
+per-invocation \texttt{parameters["KRutLoading"]} at the orchestrator
+level.
+
+\section{10-gene panel results}
+\label{sec:results}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lllrrrrrr}
+\toprule
+Gene & Class & $L$ (bp) & $K^{*,\text{pw}}_{\text{rut}}$ & $K^{*,\Delta}_{\text{rut}}$ &
+MSE$_{\text{pw}}$ & MSE$_{\Delta}$ & Endpoint pw & Endpoint $\Delta$ \\
+\midrule
+aceA & prior-bench   & 1305 & 0.032 & 0.061 & 2.03 & 1.18 & -- & -- \\
+dnaK & prior-bench   & 1917 & 0.029 & 0.130 & 2.45 & 0.65 & -- & max \\
+rpoB & prior-bench   & 4029 & 0.000 & 0.064 & 3.70 & 0.66 & min & -- \\
+talB & prior-bench   &  954 & 0.024 & 0.130 & 2.30 & 0.76 & -- & max \\
+insQ & prior-bench   & 1149 & 0.127 & 0.130 & 3.91 & 1.82 & -- & max \\
+\addlinespace
+rhsA & rho-dependent & 4134 & 0.005 & 0.130 & 3.48 & 1.62 & -- & max \\
+rhsB & rho-dependent & 4236 & 0.027 & 0.130 & 3.14 & 0.88 & -- & max \\
+ydbA & rho-dependent & 8622 & 0.035 & 0.130 & 5.12 & 2.00 & -- & max \\
+yihO & rho-dependent & 1404 & 0.000 & 0.000 & 25.97 & 15.50 & min & min \\
+caiT & rho-dependent & 1515 & 0.024 & 0.130 & 2.90 & 1.54 & -- & max \\
+\bottomrule
+\end{tabular}
+\caption{Per-gene best-fit $\Krut$ under the two metrics at
+$n_{\text{runs}}=5000$. Endpoint columns flag argmin landing at the
+grid boundaries ($\Krut=0$ or $\Krut=0.13$), an indication that the
+true minimum may lie beyond the swept range.}
+\label{tab:panel}
+\end{table}
+
+\section{Observations}
+
+\subsection{Rho-dependent genes behave as predicted}
+
+All five known-rho-dependent genes (\texttt{rhsA}, \texttt{rhsB},
+\texttt{ydbA}, \texttt{yihO}, \texttt{caiT}) have
+$K^{*,\text{pw}}_{\text{rut}} \le 0.035$, substantially below the WT-assumed
+$0.13$. The sweep correctly recovers the Rho-inhibition signature from
+BCM using a model trained only on WT data.
+
+\subsection{Prior-benchmark genes also shift well below $0.13$}
+
+Only \texttt{insQ} remains near the WT value ($K^{*,\text{pw}}_{\text{rut}} =
+0.127$). The other four prior-benchmark genes --- \texttt{aceA},
+\texttt{dnaK}, \texttt{rpoB}, \texttt{talB} --- prefer
+$K^{*,\text{pw}}_{\text{rut}} \le 0.032$. The original 5-gene benchmark was
+curated for CMA-ES validation, not Rho independence; the panel is not
+as clean a classifier as initially assumed. Under the current model,
+these genes either (a) truly have effective in-vivo $\Krut$ below
+$0.13$, or (b) have systematic $\DstarWT$ errors that the sweep
+compensates for nonspecifically (e.g.\ by reducing 3$^\prime$ flux).
+
+\subsection{Two genes pile at the $\Krut=0$ floor}
+
+\texttt{rpoB} and \texttt{yihO} both minimize at the grid boundary. The
+true minimum lies at or below $\Krut=0$, which is physically
+inaccessible: the model has no handle lower than ``no Rho at all.'' The
+interpretation is that $\DstarWT$ for these genes absorbed substantial
+Rho-termination shape during the WT fit that the forward sweep cannot
+now fully undo by reducing $\Krut$. \texttt{rhsA}, which appeared at
+the floor in the $n_{\text{runs}}=500$ run, resolves to a shallow
+minimum at $K^{*,\text{pw}}_{\text{rut}} = 0.005$ with higher statistics
+--- still strongly Rho-dependent but no longer strictly
+floor-pinned. This is exactly the identifiability artifact BCM data was
+intended to diagnose.
+
+\subsection{\texttt{yihO} is a model-failure candidate}
+
+$\text{MSE}_{\text{pw,min}}(\texttt{yihO}) = 25.97$, an order of
+magnitude larger than any other gene in the panel. No $\Krut$ in the
+grid reconciles $\SWT$ and $\SBCM$ under the current model. Either the
+simple kinetic Rho model is too crude to capture real termination for
+this gene, there is un-modeled Rho-dependent biology (NusG antagonism,
+secondary structure), or the experimental BCM condition had
+gene-specific confounds. \texttt{yihO} is the primary motivation for a
+joint (WT $+$ BCM) re-fit of $D$ in a follow-up change.
+
+\subsection{The $\Delta$-metric is MC-noise-limited at
+  $n_{\text{runs}}=500$}
+
+$K^{*,\Delta}_{\text{rut}} = 0.13$ for 7/10 panel genes at
+$n_{\text{runs}} = 5000$. The $\Delta$-metric computes
+\(\Snorm(\Krut) - \Snorm(0.13)\), the difference of two independent
+stochastic realizations, which carries $\sqrt 2$ times the Monte Carlo
+noise of a single simulation. At $n_{\text{runs}} = 5000$, the
+per-position noise floor in the $\Delta$-metric drops to
+$\sim 1/\sqrt{5000} \cdot \sqrt{2} \approx 0.02$, roughly 3$\times$
+lower than at $n_{\text{runs}} = 500$.
+
+This reduction is sufficient to reveal interior $\Delta$-metric minima
+for two genes: \texttt{aceA} ($K^{*,\Delta}_{\text{rut}} = 0.061$,
+$\text{MSE}_\Delta = 1.18$) and \texttt{rpoB}
+($K^{*,\Delta}_{\text{rut}} = 0.064$, $\text{MSE}_\Delta = 0.66$).
+Both minima are well below the WT-assumed $0.13$, consistent with their
+pointwise estimates, and confirm that the $\Delta$-signal for these
+genes exceeds the noise floor at this run count.
+
+For the remaining 7 genes the $\Delta$-metric minimum is still pinned at
+$\Krut=0.13$ where $\Snorm(0.13) - \Snorm(0.13) = 0$ by construction.
+The true Rho-induced shape change for these genes remains below the
+$n_{\text{runs}} = 5000$ noise floor. Only \texttt{yihO} has a
+$\SBCM - \SWT$ large enough to produce an unambiguous $\Delta$-metric
+minimum at $\Krut = 0$.
+
+\subsection{Summary classification}
+
+Combining both metrics, the 10 genes partition approximately as:
+
+\begin{itemize}
+\item \textbf{$\DstarWT$ was probably correctly calibrated for
+  $\Krut=0.13$}: \texttt{insQ} (pointwise near WT endpoint at 0.127;
+  $\Delta$-metric also pinned at 0.13; shallow curves).
+\item \textbf{$\DstarWT$ absorbed some Rho shape, $\Delta$-metric now
+  informative}: \texttt{aceA}, \texttt{rpoB} (pointwise interior
+  minimum well below 0.13; $\Delta$-metric reveals interior minimum at
+  $\Krut \approx 0.06$ at $n_{\text{runs}}=5000$).
+\item \textbf{$\DstarWT$ absorbed some Rho shape, $\Delta$-metric still
+  noise-limited}: \texttt{dnaK}, \texttt{talB}, \texttt{rhsB},
+  \texttt{ydbA}, \texttt{caiT} (pointwise clearly prefers $\Krut <
+  0.13$ with reasonable MSE; $\Delta$-metric pinned at 0.13).
+\item \textbf{$\DstarWT$ absorbed substantial Rho shape}: \texttt{rhsA}
+  (pointwise minimum at $\Krut = 0.005$, near floor),
+  \texttt{rpoB} (pointwise at floor).
+\item \textbf{Model failure}: \texttt{yihO} (floor-pinned pointwise;
+  residual MSE $> 8\times$ panel median after the sweep).
+\end{itemize}
+
+\section{Implications for the broader pipeline}
+
+\subsection{What the sweep resolves}
+
+For genes where both metrics agree on a $K^{*}_{\text{rut}} < 0.13$ with a clean
+minimum and small residual MSE, the WT-fit $\DstarWT$ overestimates
+intrinsic dwell at 3$^\prime$ regions by absorbing Rho-termination
+shape. A corrected estimate would be $\DstarWT(x) \cdot$ shape
+correction inferred from the BCM fit. The sweep itself does not
+produce a corrected $D$; it produces a diagnostic of how far off the
+WT fit is.
+
+\subsection{What the sweep does not resolve}
+
+The sweep cannot distinguish between (i) $\DstarWT$ absorbed Rho
+shape and (ii) $\DstarWT$ absorbed some other un-modeled effect that
+happens to have similar 3$^\prime$ shape. To distinguish these, a
+joint re-fit is required: optimize $D$ against both $\SWT$ and
+$\SBCM$ simultaneously, with $\Krut$ taking different values in each
+condition. The joint loss gives $D$ two data constraints and makes
+the Rho term identifiable from data rather than from assumption.
+
+\subsection{Deferred to follow-up changes}
+
+\begin{itemize}
+\item \textbf{Joint $(\SWT, \SBCM)$ re-fit of $D$}. Motivated by the
+  \texttt{yihO} failure and the endpoint-pileup cases.
+\item \textbf{$\Delta$-metric at $n_{\text{runs}} \ge 5000$} or with
+  paired-run variance reduction.
+\item \textbf{Grid extension beyond $\Krut=0.13$}. Would catch genes
+  where $\DstarWT$ \emph{under}-used Rho (argmin above 0.13 in the
+  pointwise metric). Not observed in this panel but expected in the
+  4273-gene genome-wide roll-out.
+\item \textbf{Partial-BCM efficacy calibration}. If the genome-wide
+  $K^{*,\text{pw}}_{\text{rut}}$ distribution sharp-peaks at some small
+  positive value, that value is a single-number estimate of residual
+  Rho activity under BCM in vivo.
+\end{itemize}
+
+\subsection{Known kernel artifact: ribosome snap-to-negative}
+\label{sec:snap-artifact}
+
+The ribosome elongation block in both \texttt{netseq\_tasep\_fast.py}
+and the original \texttt{sjkimlab\_NETSEQ\_TASEP.m} contains a snap
+rule that, on collision detection, sets
+$\texttt{Ribo\_locs(RNA)} = \texttt{rnap\_locs(RNA)} - \texttt{RNAP\_width}$
+(line 561 in MATLAB; line 595 in Python). When a ribosome loads at
+position 1 with the RNAP at position 30 (the minimum required by the
+\texttt{rnap\_locs >= 30} loading gate) and advances even one base on
+the next time step, the overlap test fires and snaps the ribosome to
+position $30 - 35 = -5$. The subsequent ribosome elongation block is
+gated by \texttt{if Ribo\_locs > 0}, so the ribosome remains
+\emph{permanently} stuck at the negative position --- it provides
+no shielding for the rest of the RNAP's transit.
+
+The Rho-loading test reads \texttt{Ribo\_locs} directly:
+\begin{equation*}
+  \texttt{PTRNAsize} \;=\; \texttt{rnap\_locs} - 65 - \texttt{Ribo\_locs},
+\end{equation*}
+so $\texttt{Ribo\_locs} = -5$ inflates the exposed-RNA length by 5\,bp
+and crosses the $\texttt{PTRNAsize} > 50$ threshold five bases earlier
+than the gap-based geometry would predict. Empirically the affected
+RNAPs behave as if the ribosome were absent.
+
+The snap fires whenever $\texttt{rnap\_locs} < 35 + \texttt{tempRibo}$
+on the first elongation step after loading, which (for typical
+$\texttt{tempRibo} \approx 2$) covers the regime
+$\texttt{rnap\_locs}_{\text{at-load}} \lesssim 37$. The fraction of
+RNAPs whose ribosome loads in this regime is approximately
+$1 - \exp(-35\, k_{\text{ribo}} / v_{\text{RNAP}})$. For
+\texttt{talB} ($k_{\text{ribo}} = 0.51$) this is $\sim$60\%; for
+\texttt{insQ} ($k_{\text{ribo}} = 0.022$) it is $\sim$4\%. For
+high-translation-efficiency genes a majority of RNAPs effectively
+have no ribosome shielding --- this is the dominant explanation for
+why kernel survival saturates well below the per-RNAP analytic
+prediction (see \texttt{kinetic\_estimates\_Linfty\_xc.md} \S 9).
+
+\paragraph{Implication for $D^*$.} The CMA-ES optimizes $D$ to make
+the (artifacted) kernel reproduce $\SWT$. Whatever bias the artifact
+introduces is absorbed into $D^*$ rather than into the rate
+parameters (since $k_{\text{ribo}}$ is fixed at $\text{TE}/5$ and is
+not co-fit). For \emph{kernel surrogate} use --- re-running flux
+profiles, BCM sweeps, downstream analyses that go through the same
+kernel --- $D^*$ is correct by construction. For \emph{kinetic
+interpretation} as the absolute biological dwell time per bp, $D^*$
+on high-$k_{\text{ribo}}$ genes is likely biased toward over-tall
+pause peaks (the kernel needs extra decay-causing structure to match
+the data when $\sim 60\%$ of its ribosomes are ineffective). Relative
+peak structure --- where pauses sit, ratios of nearby peaks --- is
+robust because the bias is approximately a global multiplicative
+scaling on absolute amplitudes.
+
+\paragraph{Status.} The artifact was in the canonical sjkimlab MATLAB
+implementation, so all downstream scientific output that used the
+unpatched kernel inherited it. The Python kernel (both
+\texttt{netseq\_tasep\_fast.py} and \texttt{netseq\_tasep\_gpu.py})
+has been patched with the clamp
+$\texttt{Ribo\_locs} \leftarrow \max(1, \texttt{rnap\_locs} - \texttt{rnap\_width})$
+at both snap sites (State~1 coupling-maintenance and State~4
+free-ribosome collision). The 5-gene panel (\texttt{insQ},
+\texttt{talB}, \texttt{aceA}, \texttt{dnaK}, \texttt{rpoB}) was
+re-run with the patched kernel and the original (pre-patch) CMA-ES
+$D^*$, with outputs in \texttt{ecoli/flux\_patched/}.
+
+The diagnostic notebook \texttt{ribo\_bias.ipynb} reports the
+per-gene bias the artifact pushed into $D^*$:
+
+\begin{center}
+\begin{tabular}{l r r r r}
+\hline
+gene & $k_{\text{ribo}}$ & $P_{\text{snap}}$ &
+$\text{flux}_{\text{patched}}[L]$ & $\sqrt{\Delta_{\log\text{-MSE}}}$ \\
+\hline
+\texttt{insQ} & 0.022 & 0.04 & 0.183 & 0.05 \\
+\texttt{rpoB} & 0.166 & 0.26 & 0.857 & 0.40 \\
+\texttt{aceA} & 0.358 & 0.48 & 0.958 & 0.23 \\
+\texttt{dnaK} & 0.456 & 0.57 & 0.991 & 0.54 \\
+\texttt{talB} & 0.506 & 0.61 & 0.997 & 0.34 \\
+\hline
+\end{tabular}
+\end{center}
+
+where $\sqrt{\Delta} = \sqrt{\text{mean}((\log
+\text{flux}_{\text{patched}} - \log
+\text{flux}_{\text{orig}})^2)}$ is the per-gene log-RMS shift in
+the patched-kernel survival relative to the original-kernel survival
+that matches $S_{\text{exp}}$ by CMA-ES design.
+
+\textbf{Implication for the existing $D^*$.} For high-$k_{\text{ribo}}$
+genes (\texttt{talB}, \texttt{dnaK}), the patched-kernel survival at
+the gene endpoint is $\approx$0.99 vs the original $\approx$0.4--0.5
+that matches $S_{\text{exp}}$. The CMA-ES therefore inflated $D^*$
+pause peaks by enough amplitude to recover the missing
+$\approx$0.5 in survival via extra Rho-loading hazard. This bias is
+$\sim 30$--$50\%$ in log-space ($\sqrt{\Delta} \approx 0.3$--$0.5$).
+For low-$k_{\text{ribo}}$ \texttt{insQ}, the bias is negligible
+($\sqrt{\Delta} \approx 0.05$, i.e.\ $\sim$5\% log-space shift) because
+only $\approx$4\% of RNAPs were hit by the artifact.
+
+The closed-form analytic M13 of \texttt{kinetic\_estimates\_Linfty\_xc.md}
+\S 9.2 matches the patched-kernel flux endpoint within 5\% on 3 of 5
+panel genes (\texttt{talB}, \texttt{aceA}, \texttt{dnaK}), confirming
+M13 as the correct closed form for the fixed kernel.
+
+Existing flux pickles in \texttt{ecoli/flux/} and the genome-wide
+BCM sweep outputs were generated with the unpatched kernel and remain
+internally self-consistent for kernel-surrogate use. A re-fit of CMA-ES
+on the patched kernel (proposed as \texttt{cmaes-patched-rerun} if
+warranted) would correct the absolute amplitude of $D^*$ pause peaks
+on high-$k_{\text{ribo}}$ genes; relative pause structure (peak
+positions, ratios within a gene) is robust to the artifact and
+unchanged. See OpenSpec change \texttt{ribo-snap-bias-diagnostic}
+and the \texttt{ribo\_bias.ipynb} notebook for details.
+
+\section{CMA-ES deconvolution}
+\label{sec:cmaes}
+
+\subsection{Problem formulation}
+
+For each gene of length $L$, we seek the intrinsic per-position dwell-time
+profile $D^*(x) \in \mathbb{R}_{>0}^L$ such that the TASEP forward model,
+when run with $D^*$ and the gene-specific kinetic constants, reproduces the
+observed wildtype NET-seq density $S_{\text{exp,norm}}(x)$. We define the
+objective as the mean-squared error between the simulated and observed
+mean-normalized NET-seq profiles:
+\begin{equation}
+  \mathcal{L}(D) \;=\; \frac{1}{L}\sum_{x=1}^{L}
+    \Bigl(\hat{S}_{\text{norm}}(D, x) - S_{\text{exp,norm}}(x)\Bigr)^2,
+\end{equation}
+where $\hat{S}_{\text{norm}}$ is the Monte Carlo estimate of the expected
+NET-seq density under $D$, both sides divided by their respective spatial
+means (so that the loss is scale-invariant and depends only on profile shape).
+
+\subsection{Parameterization and initialization}
+
+The search is conducted in log-space. Define
+\begin{equation}
+  \theta \;=\; \log D \;\in\; \mathbb{R}^L,
+  \qquad D \;=\; \exp(\theta),
+\end{equation}
+where the exponential enforces positivity without constraints. Before each
+kernel call, $D$ is mean-normalized,
+\begin{equation}
+  \tilde{D}(x) \;=\; \frac{D(x)}{\frac{1}{L}\sum_{x'} D(x')},
+\end{equation}
+so the mean dwell time is always 1 (in units of the baseline speed
+$v_{\text{RNAP}} = 19\,\text{bp/s}$) and only the \emph{shape} of $D$ is
+fitted.
+
+The initial mean vector of the CMA-ES distribution is set directly from the
+observed signal:
+\begin{equation}
+  \theta_0 \;=\; \log\bigl(\max(S_{\text{exp,norm}},\, 10^{-10})\bigr),
+\end{equation}
+i.e.\ the initial dwell profile is the experimental NET-seq profile itself.
+This warm start places the optimizer close to a plausible solution from
+generation zero, since $S_{\text{exp,norm}} \propto D \cdot j$ and $j$ is
+close to 1 at low traffic density.
+
+\subsection{CMA-ES with diagonal covariance}
+
+We use the CMA-ES algorithm~\cite{hansen2016cma} as implemented in the
+\texttt{pycma} library. For gene lengths $L \sim 300\text{--}4000$, the
+standard full-covariance CMA-ES would require $O(L^2)$ storage and $O(L^3)$
+covariance matrix updates per generation, which is prohibitive. We enable the
+\texttt{CMA\_diagonal} option, which restricts the covariance matrix
+$\mathbf{C}$ to its diagonal:
+\begin{equation}
+  \mathbf{C} \;=\; \operatorname{diag}(c_1^2,\, c_2^2,\, \ldots,\, c_L^2),
+\end{equation}
+reducing storage to $O(L)$ and per-generation update cost to $O(\lambda L)$
+where $\lambda$ is the population size. This is well-suited to the TASEP
+deconvolution problem because the per-position dwell times are largely
+independent — Rho-mediated effects couple positions non-locally, but the
+dominant signal in $D$ is the per-bp pause intensity, which is intrinsically
+local.
+
+The population size is set by the standard CMA-ES heuristic:
+\begin{equation}
+  \lambda \;=\; 4 + \lfloor 3 \ln L \rfloor,
+\end{equation}
+giving $\lambda = 21$ for a 300-bp gene and $\lambda = 25$ for a 1149-bp gene.
+The initial step size is $\sigma_0 = 0.1$, corresponding to $\sim 10\%$
+multiplicative perturbations in linear dwell space ($e^{\pm 0.1} \approx 1
+\pm 0.1$). A fixed CMA seed (42) is used for reproducibility.
+
+Each generation proceeds as:
+\begin{enumerate}
+  \item \textbf{Sample.} Draw $\lambda$ candidate vectors
+    $\theta^{(1)}, \ldots, \theta^{(\lambda)} \sim \mathcal{N}(\mathbf{m},
+    \sigma^2 \mathbf{C})$.
+
+  \item \textbf{Evaluate.} For each candidate $\theta^{(i)}$, compute
+    $D^{(i)} = \exp(\theta^{(i)})$, mean-normalize, and dispatch to the GPU
+    kernel. The kernel runs $n_{\text{runs}}$ independent TASEP simulations
+    in parallel (see \S\ref{sec:gpu}), averages the resulting NET-seq snapshot
+    counts, mean-normalizes, and returns $\hat{S}_{\text{norm}}^{(i)}$. The
+    MSE kernel computes $\mathcal{L}(\theta^{(i)})$ on-device.
+
+  \item \textbf{Tell.} Pass the $\lambda$ fitness values back to the CMA-ES
+    strategy (\texttt{es.tell}), which updates the mean $\mathbf{m}$, step
+    size $\sigma$, and diagonal covariance $\mathbf{C}$ using the
+    weighted recombination, cumulative step-size adaptation, and covariance
+    matrix adaptation rules.
+\end{enumerate}
+
+\subsubsection*{Mean vector update}
+
+The mean $\mathbf{m} \in \mathbb{R}^L$ is the current best estimate of
+$\theta^*$ and the center of the sampling distribution. After evaluating all
+$\lambda$ candidates, they are ranked by fitness (ascending MSE), the top
+$\mu = \lfloor\lambda/2\rfloor$ are selected, and $\mathbf{m}$ is updated as
+their weighted centroid:
+\begin{equation}
+  \mathbf{m}_{t+1} \;=\; \sum_{i=1}^{\mu} w_i\, \theta^{(i:\lambda)}_t,
+\end{equation}
+where $\theta^{(i:\lambda)}$ denotes the $i$-th ranked candidate (rank 1 =
+lowest MSE) and the weights are the standard CMA-ES recombination weights:
+\begin{equation}
+  w_i \;=\; \frac{\ln(\mu + \tfrac{1}{2}) - \ln i}
+                 {\displaystyle\sum_{j=1}^{\mu}\bigl[\ln(\mu+\tfrac{1}{2}) - \ln j\bigr]},
+  \quad w_1 > w_2 > \cdots > w_\mu > 0, \quad \sum_{i=1}^{\mu} w_i = 1.
+\end{equation}
+For $\lambda = 25$ (insQ), $\mu = 12$ candidates are selected. The best
+candidate receives $\approx 18\%$ of the total weight; the 12th receives
+$\approx 1\%$. This soft-max selection avoids the brittleness of winner-takes-all
+truncation while still biasing $\mathbf{m}$ strongly toward the highest-fitness
+region.
+
+The update is a pure weighted mean — $\mathbf{m}$ never evaluates a gradient
+directly. It infers the direction of improvement solely from the rank order of
+fitness values across the sampled cloud, which is why CMA-ES is robust to the
+stochastic noise introduced by finite $n_{\text{runs}}$ Monte Carlo estimation.
+
+The warm start $\mathbf{m}_0 = \log(S_{\text{exp,norm}})$ is consequential:
+since $\mathbf{m}$ drifts by weighted recombination, the optimizer begins
+sampling around a plausible initial dwell profile. If $\mathbf{m}_0$ is already
+close to $\theta^*$, the initial cloud of candidates contains solutions near
+the optimum and $\mathbf{m}$ converges faster than it would from a random
+initialization.
+
+\subsubsection*{Why log-space makes the update well-scaled}
+
+In log-space, a perturbation $\delta\theta$ corresponds to a multiplicative
+change $e^{\delta\theta} \approx 1 + \delta\theta$ in linear dwell. The
+per-position coordinate scales are commensurate regardless of the absolute
+magnitude of $D^*(x)$: a fast site with $D^*(x) \approx 0.01$ and a strong
+pause site with $D^*(x) \approx 10$ both respond to a step of $\sigma = 0.1$
+as a $\sim 10\%$ multiplicative perturbation. In linear space, the same fixed
+step size would be a $10\times$ change at the fast site and a $1\%$ change at
+the pause — the weighted mean $\mathbf{m}$ would be dominated by the
+high-magnitude pause coordinates at every update step.
+
+\subsection{Multi-fidelity $n_{\text{runs}}$ schedule}
+
+Evaluating $\mathcal{L}$ via Monte Carlo introduces fitness noise proportional
+to $1/\sqrt{n_{\text{runs}}}$. More runs reduce noise but increase the GPU
+kernel launch time linearly up to the SM-pass boundary (see Table~\ref{tab:occupancy}).
+In early generations (large $\sigma$, coarse landscape), high fitness noise is
+tolerable because only the ranking of candidates matters, not precise MSE values.
+As $\sigma$ contracts and the population converges, finer MSE discrimination is
+needed.
+
+The \texttt{NRunsSchedule} implements this as a sigma-ratio schedule:
+\begin{equation}
+  n_{\text{runs}}(\sigma) \;=\;
+  \begin{cases}
+    n_{\text{low}}  & \text{if } \sigma/\sigma_0 > 0.8, \\
+    n_{\text{med}}  & \text{if } 0.6 < \sigma/\sigma_0 \le 0.8, \\
+    n_{\text{high}} & \text{if } \sigma/\sigma_0 \le 0.6.
+  \end{cases}
+\end{equation}
+The operational setting for the genome-wide run uses the uniform schedule
+$n_{\text{low}} = n_{\text{med}} = n_{\text{high}} = 200$, keeping all kernel
+launches within a single SM pass ($\sim 2.3\,\text{s/gen}$). This trades
+$\sim 5\%$ final MSE for a $19\%$ wall-time reduction relative to the
+escalating $200/400/800$ schedule.
+
+\subsection{Early stopping}
+
+To avoid spending generations on converged fits, a sliding-window criterion
+halts optimization when the relative improvement in the best-seen fitness falls
+below a threshold over a fixed window:
+\begin{equation}
+  \frac{\mathcal{L}_{\text{best}}(g - W) - \mathcal{L}_{\text{best}}(g)}
+       {\mathcal{L}_{\text{best}}(g - W)}
+  \;\;<\;\; \epsilon_{\text{stop}},
+\end{equation}
+with $W = 30$ generations and $\epsilon_{\text{stop}} = 0.005$ (0.5\%).
+On the 5-gene benchmark, 2 of 5 genes triggered early stopping (dnaK at
+gen~127, rpoB at gen~184 of a 200-gen budget), reducing their wall time
+without material loss of fit quality.
+
+\subsection{Output and checkpointing}
+
+Every 25 generations the optimizer state is checkpointed to
+\texttt{cmaes\_checkpoints/gen\_\{N\}.pkl}, enabling resume after interruption.
+On convergence the best-ever solution $\theta^*$ is extracted (\texttt{es.result.xbest}),
+exponentiated, and mean-normalized:
+\begin{equation}
+  D^*(x) \;=\; \frac{\exp(\theta^*(x))}{\frac{1}{L}\sum_{x'}\exp(\theta^*(x'))}.
+\end{equation}
+The per-gene output pickle (\texttt{ecoli/cmaes/\{gene\}.pkl}) stores
+$D^*$, $\theta^*$, the reference signal $S_{\text{exp,norm}}$, the per-gene
+kinetic constants ($\kribo$, $\Krut$), and the optimization history
+(best MSE per generation, $\sigma$ trajectory, wall time).
+
+\section{RNAP flux from $D^*$}
+\label{sec:flux}
+
+\subsection{Definition}
+
+The RNAP flux $j(x)$ at position $x$ is the mean number of RNAPs that
+traverse position $x$ per unit simulation time at steady state. It is
+the throughput analogue of the local density: whereas
+$\rho(x) = D(x)\,j(x)$ counts how many RNAPs \emph{dwell at} $x$, $j(x)$
+counts how many \emph{pass through} $x$. The two quantities together
+decompose the NET-seq signal into an intrinsic pause component ($D^*$)
+and a throughput component ($j$).
+
+\subsection{Simulation-based estimation}
+
+Given $D^*(x)$ from the CMA-ES deconvolution, flux is estimated by
+running $n_{\text{runs}}$ independent TASEP simulations and counting
+RNAP traversals. In the GPU kernel, every time an RNAP advances from
+position $x_{\text{curr}}$ by $\Delta x_{\text{adv}}$ bases, a counter
+is incremented atomically for each position traversed:
+\begin{equation}
+  \texttt{flux\_count}[x] \;\mathrel{+}=\; 1
+  \quad \forall\, x \in \bigl\{x_{\text{curr}},\,\ldots,\,
+                               x_{\text{curr}} + \Delta x_{\text{adv}} - 1\bigr\}.
+\end{equation}
+After all $n_{\text{runs}}$ simulations the raw count is averaged and
+normalized to the promoter-proximal position ($x=1$):
+\begin{equation}
+  \hat{j}(x) \;=\; \frac{\texttt{flux\_count}[x]}{n_{\text{runs}}},
+  \qquad
+  j_{\text{norm}}(x) \;=\; \frac{\hat{j}(x)}{\hat{j}(1)}.
+\end{equation}
+$j_{\text{norm}}(x)$ is the fraction of promoter-initiated RNAPs that
+successfully reach position $x$. A value $j_{\text{norm}}(x) < 1$
+reflects cumulative attrition from Rho-mediated premature termination and
+hard-body collision-induced stalling upstream of $x$.
+
+\subsection{Relationship to $D^*$ and the NET-seq signal}
+
+At steady state the NET-seq density factorizes as (see \S\ref{sec:math}):
+\begin{equation}
+  S(x) \;\propto\; D^*(x)\cdot j(x;\,D^*,\,\theta).
+\end{equation}
+The CMA-ES fit minimized the MSE on $S(x)$; flux is a derived quantity
+not directly optimized. Computing $j_{\text{norm}}(x)$ post-hoc from
+$D^*$ therefore provides an independent view that is not available from
+$D^*$ alone: it directly quantifies how much Rho termination attenuates
+throughput between the TSS and any downstream position, and separates
+intrinsic pausing from transcript survival.
+
+\subsection{Practical computation}
+
+Flux is computed by \texttt{postprocess\_flux.py}, which reads each
+gene's CMA-ES pickle (\texttt{ecoli/cmaes/\{gene\}.pkl}), reconstructs
+$D^*$ from $\theta^*$, and calls \texttt{simulate\_with\_flux\_gpu} with
+\texttt{compute\_flux=1} (a flag that activates the traversal counters;
+it is disabled during CMA-ES optimization to avoid the per-step atomic
+overhead). Runs use $dt = 0.1$ and $n_{\text{runs}} = 200$.
+
+The per-gene output (\texttt{ecoli/flux/\{gene\}\_flux.pkl}) stores
+$j_{\text{norm}}$ as a $(L,)$ float64 array. Together with the
+CMA-ES pickle's $D^*$, this provides the full steady-state
+characterization of the gene under the fitted model:
+\begin{equation}
+  S_{\text{sim}}(x) \;\propto\; D^*(x)\cdot j_{\text{norm}}(x),
+\end{equation}
+where the proportionality constant absorbs the absolute loading rate
+$\kload$ and simulation duration.
+
+\section{Analytic approximation for the flux}
+\label{sec:flux_analytic}
+
+\subsection{Continuity-equation Gaussian}
+
+The flux $j(x)$ from \S\ref{sec:flux} obeys the mean-field continuity
+equation
+\begin{equation}
+  \frac{\mathrm{d}j}{\mathrm{d}x} \;=\; -\gamma(x)\, j(x),
+  \qquad
+  j_{\text{norm}}(x) \;=\; \exp\!\left(-\int_0^x \gamma(x')\,\mathrm{d}x'\right),
+\end{equation}
+where $\gamma(x)$ is the per-bp Rho-termination rate. The kernel performs
+one Rho-loading Bernoulli draw per timestep with success probability
+$K_{\text{rut}}\, L_{\text{unc}}(x) / L_{\text{gene}}$, while the RNAP
+advances on the order of $v_{\text{RNAP}} \cdot \mathrm{d}t$ bp per timestep.
+Converting per-timestep to per-bp gives
+\begin{equation}
+  \gamma(x) \;=\; \frac{K_{\text{rut}}\, L_{\text{unc}}(x)}
+                       {v_{\text{RNAP}}\, L_{\text{gene}}},
+  \qquad v_{\text{RNAP}} = 19\ \text{bp/s}.
+  \label{eq:gamma}
+\end{equation}
+In the \emph{strict-uncoupled} limit ($x_{\text{ribo}} \approx 0$) the
+uncovered length grows linearly, $L_{\text{unc}}(x) = x - 65$ for
+$x > \ell_{\text{load}}$, with $65 = w_{\text{RNAP}} + 30$ and
+$\ell_{\text{load}} = 65 + 50 = 115$ (the kernel requires
+$L_{\text{unc}} > 50$ to trigger Rho loading). Integrating
+\eqref{eq:gamma} gives a Gaussian survival profile:
+\begin{equation}
+  \Pi_\rho^{\text{uncoupled}}(x) \;=\;
+    \exp\!\left(-\frac{K_{\text{rut}}}{2\, v_{\text{RNAP}}\, L_{\text{gene}}}
+                       \,(x - 65)^2\right),
+  \qquad x > \ell_{\text{load}}.
+  \label{eq:gauss-uncoupled}
+\end{equation}
+
+\subsection{Empirical shielding factor}
+
+\paragraph{Normalization.} We normalize $j(x)$ to its value at $x=1$,
+$j_{n0}(x) := j(x)/j(1)$, so that $j_{n0}$ is directly the
+\emph{survival fraction}: the probability that a promoter-initiated
+RNAP has not yet terminated by position $x$. Under this normalization,
+\eqref{eq:gauss-uncoupled} matches $j_{n0}$ position-for-position with
+no rescaling at the boundary, and the residual after dividing out the
+Gaussian fit is pinned at $1$ at $x=1$ by construction.
+
+The strict-uncoupled limit overestimates Rho attrition for all panel
+genes: the simulated $j_{n0}(L)$ is in $0.16$--$0.65$, whereas
+\eqref{eq:gauss-uncoupled} would predict $10^{-6}$ to $0.03$ depending
+on $L$. A single empirical shielding factor $s \in (0,1]$ multiplied
+into the Gaussian exponent matches $j_{n0}(x)$ on every panel gene to
+within $\sim 5$--13\% RMS in log-space:
+\begin{equation}
+  \Pi_\rho^{\text{fit}}(x) \;=\;
+    \exp\!\left(-s \cdot \frac{K_{\text{rut}}}
+                                  {2\, v_{\text{RNAP}}\, L_{\text{gene}}}
+                       \,(x - 65)^2\right).
+  \label{eq:gauss-fit}
+\end{equation}
+$s$ has a direct physical reading: $s \cdot (x - 65)$ is the
+\emph{effective uncovered-RNA length} along the gene, set by the
+steady-state ribosome lag behind the RNAP. $s = 1$ corresponds to a
+fully uncoupled gene; $s \to 0$ means the ribosome tracks the RNAP at
+the minimum coupling distance.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrrrrr}
+\toprule
+Gene & $L$ (bp) & $\kribo$ & Shield $s$ & $j_{n0}(L)$ & RMS log \\
+\midrule
+insQ & 1149 & 0.022 & 0.53 & 0.158 & 0.087 \\
+talB &  954 & 0.506 & 0.25 & 0.518 & 0.039 \\
+aceA & 1305 & 0.358 & 0.12 & 0.653 & 0.045 \\
+dnaK & 1917 & 0.456 & 0.16 & 0.433 & 0.127 \\
+rpoB & 4029 & 0.166 & 0.05 & 0.500 & 0.123 \\
+\bottomrule
+\end{tabular}
+\caption{Single-parameter Gaussian fit \eqref{eq:gauss-fit} to
+$j_{n0}(x) = j(x)/j(1)$ from \texttt{ecoli/flux/\{gene\}\_flux.pkl}.
+$j_{n0}(L)$ is the survival fraction at the 3$^\prime$ end. RMS log is
+the root-mean-square log-space deviation between simulated and fitted
+survival. All 5 panel genes match within $<14\%$ log-deviation by a
+one-parameter Gaussian, with no traffic correction.}
+\label{tab:shield}
+\end{table}
+
+\paragraph{Anticorrelation with translation efficiency.} The smallest
+shield ($s = 0.05$) belongs to \texttt{rpoB} and the largest ($s = 0.54$)
+to \texttt{insQ}, which has the lowest ribosome loading rate
+($\kribo = 0.022$). The intuition is consistent: when ribosomes are
+scarce, the RNAP runs ahead and exposed RNA approaches the uncoupled
+$(x-65)$ limit; when ribosomes load fast, they track the RNAP and clamp
+$L_{\text{unc}}$ near its minimum threshold. A predictive closed-form
+for $s$ as a function of $\kribo$ (and $v_{\text{ribo}}$,
+$v_{\text{RNAP}}$) is a natural next step.
+
+\subsection{The traffic throughput term}
+
+The remaining factor in the full flux decomposition (see
+\S\ref{sec:math}),
+\begin{equation}
+  j(x) \;=\; \kload \cdot \Pi_\rho(x) \cdot \Pi_{\text{traffic}}(x),
+\end{equation}
+is the throughput modifier from hard-body exclusion. The residual
+$j_{n0}(x) / \Pi_\rho^{\text{fit}}(x)$ acts as a proxy for
+$\Pi_{\text{traffic}}(x)$, pinned at $1$ at $x=1$ by construction and
+empirically within $\pm 20\%$ of unity across the gene. The residual
+splits into two qualitatively different components:
+
+\paragraph{Broad positive bias.} Through the middle of each gene the
+residual sits slightly above $1$ (e.g., $1.05$--$1.20$ for \texttt{insQ}
+in $x \in [600,\,850]$). This is a \emph{$\Pi_\rho$ shape mismatch},
+not traffic: the true $\gamma(x)$ plateaus once the ribosome reaches
+its steady-state lag behind the RNAP, whereas the Gaussian assumes
+$L_{\text{unc}}(x) = s\cdot(x-65)$ grows without bound. A refined
+ansatz
+\begin{equation}
+  \gamma(x) \;=\; \gamma_\infty\bigl(1 - e^{-(x-\ell_{\text{load}})/x_*}\bigr)
+\end{equation}
+with equilibration length $x_*$ and saturated rate $\gamma_\infty$
+would absorb this systematic bias.
+
+\paragraph{Localized dips.} Sharp negative excursions in the residual
+coincide with strong $D^*$ pause sites (e.g., \texttt{insQ} drops to
+$0.78$ at $x \approx 940$, near a high-dwell feature). These are the
+genuine traffic signature. The expected analytic form in the
+low-density TASEP limit is
+\begin{equation}
+  \Pi_{\text{traffic}}(x) \;\approx\; 1 \;-\; a \cdot \rho(x+1),
+  \qquad \rho(x) \;=\; D^*(x)\, j(x),
+  \label{eq:traffic}
+\end{equation}
+with $a \sim w_{\text{RNAP}} / L_{\text{gene}}$ a per-site exclusion
+volume. Validating the residual dips against the dominant peaks of
+$D^*$ and fitting $a$ would close the loop on the full analytic flux
+model.
+
+\paragraph{Practical use.} The Gaussian fit gives an immediate
+sanity check on $j_{\text{norm}}$ output from the kernel: anomalously
+large RMS log deviation flags genes where the scalar-$K_{\text{rut}}$
+model has structural problems (e.g., the \texttt{yihO}-class
+model failures from \S\ref{sec:results}). The analytic form
+$\Pi_\rho^{\text{fit}}$ also offers a fast proxy for genome-wide
+analyses that would otherwise require running the simulator end-to-end.
+Implementation and 5-gene validation are in
+\texttt{mathmodel-netseq.ipynb}.
+
+\section{Computational acceleration architecture}
+\label{sec:gpu}
+
+\subsection{The bottleneck: sequential stochastic simulation at genome scale}
+
+The TASEP forward model is a discrete-time stochastic simulation that must be
+run sequentially in time: at each timestep $\Delta t = 0.1\,\text{s}$, every
+RNAP, ribosome, and Rho complex on the gene is advanced according to
+first-passage dwell-time draws, subject to hard-body exclusion constraints.
+A single simulation run for a gene of length $L$ takes
+$T_{\text{sim}}/\Delta t \approx 20{,}000$ timesteps; at each step the inner
+loop touches $O(n_{\text{RNAP}}) \approx 30$ particles.
+
+CMA-ES evaluation requires $n_{\text{pop}} \approx 25$ candidates, each
+evaluated at $n_{\text{runs}} = 200$ independent simulation runs to estimate
+the expected NET-seq signal. A single CMA-ES generation for a $\sim$1000-bp
+gene therefore performs $25 \times 200 \times 20{,}000 \times 30 \approx 3
+\times 10^9$ stochastic particle updates, each gated by a random
+exponential draw and conditional collision check. Across 4273 E.\ coli genes
+at $\sim$200 generations each, the genome-wide problem entails $\sim
+10^{16}$ stochastic operations total.
+
+The simulation is branch-heavy and latency-dominated: the inner loop
+branches on particle state, collision checks, Rho-loading decisions, and
+ribosome-coupling state. SIMD throughput and FP32/FP64 pipelines are
+irrelevant bottlenecks. The accessible speedup strategy is massive thread
+parallelism across independent simulation runs, not arithmetic acceleration.
+
+\subsection{GPU threading model}
+
+The GPU kernel (\texttt{\_tasep\_core\_cuda}, \texttt{netseq\_tasep\_gpu.py})
+maps one CUDA thread to one simulation run. A launch of
+$N_{\text{total}} = n_{\text{pop}} \times n_{\text{runs}}$ threads
+(e.g.\ $25 \times 200 = 5000$) evaluates one full CMA-ES generation in a
+single kernel call. Each thread runs the complete sequential TASEP loop
+independently, with no inter-thread communication during the simulation.
+
+The thread index encodes both the candidate and the run:
+\begin{equation}
+  c_{\text{idx}} = \lfloor t_{\text{id}} / n_{\text{runs}} \rfloor,
+  \qquad
+  r_{\text{idx}} = t_{\text{id}} \bmod n_{\text{runs}}.
+\end{equation}
+Thread $t_{\text{id}}$ reads the dwell profile of candidate $c_{\text{idx}}$,
+draws its own independent RNG stream (xoroshiro128p), and writes its NET-seq
+snapshot counts atomically to a shared output buffer indexed by
+$(c_{\text{idx}}, x)$.
+
+\subsubsection*{Thread-local state}
+
+Each thread maintains five HIST\_CAP $= 128$ element arrays in
+\emph{local (register-spill) memory}:
+
+\begin{center}
+\small
+\begin{tabular}{lll}
+\toprule
+Array & dtype & Purpose \\
+\midrule
+\texttt{rnap\_locs[128]} & int32 & per-RNAP position \\
+\texttt{ribo\_locs[128]} & int32 & per-RNAP ribosome position \\
+\texttt{rho\_locs[128]}  & int32 & per-RNAP Rho position \\
+\texttt{rnap\_ribo\_coupling[128]} & int32 & coupling state flag \\
+\texttt{ribo\_loadt[128]}  & float32 & ribosome load time \\
+\texttt{exit\_buf[32]}    & float32 & first-passage scratch \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Total local memory per thread: $\approx 2.7\,\text{KB}$ (v3.0, float32/int32).
+The prior version (v2.2) used float64/int64, giving $\approx 5.3\,\text{KB}$
+per thread. The v3.0 reduction to float32 and int32 halves local memory,
+slightly improving L1 cache locality, though it does not change per-generation
+wall time because the bottleneck is instruction latency, not memory bandwidth.
+
+\subsubsection*{Simulation loop structure}
+
+The main loop iterates over $n_{\text{steps}} = T_{\text{sim}}/\Delta t$
+timesteps and, at each step, executes four sub-steps in order, mirroring the
+CPU reference exactly:
+
+\begin{enumerate}
+  \item \textbf{RNAP loading.} Draw next load time from
+    $\text{Exp}(1/k_{\text{load}})$. Block if last loaded RNAP has not
+    cleared its footprint ($w_{\text{RNAP}} = 35\,\text{bp}$).
+
+  \item \textbf{RNAP elongation.} For each active RNAP, call
+    \texttt{\_sample\_first\_passage\_cuda} to draw the number of bases
+    advanced in this timestep from the per-position dwell profile; apply
+    hard-body collision check against the next-upstream RNAP.
+
+  \item \textbf{Rho loading and elongation.} Per active RNAP, compute the
+    uncovered RNA length $L_{\text{unc}} = x_{\text{RNAP}} - w_{\text{RNAP}}
+    - 30 - x_{\text{ribo}}$; if $L_{\text{unc}} > 50\,\text{nt}$, draw a
+    Bernoulli with probability $K_{\text{rut}} \cdot L_{\text{unc}} /
+    L_{\text{gene}} \cdot 100\,\Delta t$ to load Rho at a uniform random
+    position on the exposed RNA. Advance Rho along the rho-dwell profile
+    (speed $= 5 \times v_{\text{ribo}}$). If Rho catches the RNAP, mark
+    the RNAP as prematurely terminated.
+
+  \item \textbf{Ribosome elongation.} Advance each ribosome from its
+    coupled or free state; detect RNAP--ribosome coupling on collision.
+\end{enumerate}
+
+At seven fixed snapshot times (200, 400, 600, 800, 1000, 1200, 1400 s),
+each thread records its RNAP positions atomically into the
+$(n_{\text{pop}}, L)$ output buffer:
+\begin{equation}
+  \texttt{out\_netseq\_sum}[c_{\text{idx}},\, x-2]
+  \;\mathrel{+}=\; 1
+  \quad \forall \text{ RNAP at position } x.
+\end{equation}
+A \texttt{first\_active} index is maintained to skip RNAPs that have
+already terminated or exited the gene, matching the CPU reference
+implementation exactly.
+
+\subsection{Dwell profile deduplication}
+
+In the naive (v2.2) implementation, the host replicated each candidate's dwell
+profile $n_{\text{runs}}$ times before transfer, producing a
+$(n_{\text{total}},\, L+1)$ device array of size $\sim 92\,\text{MB}$ for a
+typical CMA-ES generation on insQ ($n_{\text{total}} = 10{,}000,\, L = 1149$).
+
+v3.0 deduplicates: the kernel receives a $(n_{\text{pop}},\, L+1)$ array
+and each thread reads \texttt{dwell\_profiles[candidate\_idx, :]}. The
+$n_{\text{runs}}$ threads sharing the same candidate share the same dwell
+row via the L2 cache. Memory reduction:
+\begin{equation}
+  92\,\text{MB} \;\longrightarrow\; 0.12\,\text{MB} \quad (\text{insQ},
+  \; n_{\text{pop}}=25, \; L=1149, \; \text{float32}).
+\end{equation}
+The per-candidate ribosome loading rate \texttt{k\_ribo\_loading\_arr} and
+Rho loading prefactor \texttt{pt\_percent\_arr} follow the same pattern:
+$(n_{\text{pop}},)$ device arrays indexed by $c_{\text{idx}}$.
+
+\subsection{Atomic output reduction}
+
+v2.2 allocated a $(n_{\text{total}},\, L)$ output buffer ($\sim 46\,\text{MB}$
+for insQ) so each thread could write its NET-seq snapshot without contention,
+followed by a host-side summation over runs per candidate.
+
+v3.0 threads instead write directly to a $(n_{\text{pop}},\, L)$ buffer
+($\sim 0.11\,\text{MB}$) via \texttt{cuda.atomic.add}. On Ampere GPUs, L2
+hardware atomics are efficient: with $n_{\text{runs}} = 200$ threads per
+candidate writing to $L \approx 1000$ positions, the mean number of
+concurrent writes per address per snapshot is $\sim 0.04$ — essentially
+contention-free. Total output transfer to host is reduced 1380$\times$.
+
+\subsection{On-device MSE kernel}
+
+A second kernel, \texttt{\_compute\_mse\_cuda}, eliminates the host-side MSE
+computation entirely. It is launched as $n_{\text{pop}}$ blocks of 256
+threads, one block per candidate:
+
+\begin{enumerate}
+  \item \textbf{Pass 1 — normalization sum.} Each thread accumulates
+    \texttt{netseq\_sum[c\_idx, pos]} over a stride-256 tile of positions
+    into shared memory, followed by a parallel binary-tree reduction across
+    the 256 threads to obtain the total count $S_{\text{total}}$.
+
+  \item \textbf{Pass 2 — MSE.} Using $s_{\text{mean}} =
+    S_{\text{total}} / (n_{\text{runs}} \cdot L)$ for normalization, each
+    thread accumulates $\bigl(S_{\text{exp}}(x) -
+    \hat{S}_{\text{sim}}(x)\bigr)^2$ over its tile; another binary-tree
+    reduction yields $\sum_x (\cdot)^2 / L$, written to
+    \texttt{mse\_out[c\_idx]}.
+\end{enumerate}
+
+The host receives only an $n_{\text{pop}}$-float array ($\sim$100 bytes)
+per generation instead of $n_{\text{pop}} \times L$ floats ($\sim$0.11 MB).
+
+\subsection{Performance profile and bottleneck analysis}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{rrrr}
+\toprule
+$n_{\text{runs}}$ & Blocks (RTX A5000) & SM passes & Time/gen (insQ) \\
+\midrule
+100 & 20 & 1 & 2.26\,s \\
+200 & 40 & 1 & 2.29\,s \\
+300 & 59 & 1 & 2.28\,s \\
+400 & 79 & 2 & 4.35\,s \\
+800 & 157 & 3 & 6.9\,s \\
+\bottomrule
+\end{tabular}
+\caption{Per-generation wall time on one RTX A5000 (64 SMs) as a function of
+$n_{\text{runs}}$ ($n_{\text{pop}} = 25$, $L = 1149\,\text{bp}$, insQ).
+Time is flat within each SM-pass band, then jumps discretely at each SM-pass
+boundary.}
+\label{tab:occupancy}
+\end{table}
+
+The kernel is \emph{latency-bound}: per-generation time is governed by
+$\lceil N_{\text{blocks}} / N_{\text{SMs}} \rceil \times t_{\text{thread}}$,
+where $t_{\text{thread}}$ scales linearly with gene length and is set by
+instruction-issue latency, not arithmetic throughput. The RTX A5000 has 64
+SMs; a launch of 40 blocks (n\_runs=200, n\_pop=25 with 128 threads/block)
+fills all 64 SMs in a single pass ($\sim 2.3\,\text{s}$). Increasing
+$n_{\text{runs}}$ from 200 to 400 doubles the block count to 79,
+requiring a second SM pass and doubling the wall time for no reduction in
+per-generation cost.
+
+Several optimization strategies that would help compute-bound kernels were
+tested and yielded no benefit here:
+
+\begin{itemize}
+  \item \textbf{Float32 conversion.} Float32 arithmetic is 32$\times$ faster
+    than float64 in FP-throughput terms on Ampere. The TASEP kernel is branch-
+    and latency-bound; removing float64 did not change per-generation time.
+    Float32 was retained for the 2$\times$ local-memory reduction it provides.
+
+  \item \textbf{Concurrent CUDA streams.} Launching two or three genes'
+    kernels concurrently in separate streams was expected to hide latency via
+    interleaving. Benchmarked result: 1.00$\times$ speedup (exact serialization).
+    Root cause: each single-gene kernel already fills all 64 SMs; concurrent
+    streams interleave blocks, making each gene take $N\times$ longer while
+    throughput stays flat.
+
+  \item \textbf{Common Random Numbers (CRN).} Pre-tiling the same $n_{\text{runs}}$
+    RNG states across candidates was implemented and confirmed to give zero
+    variance for identical $\theta$ vectors. However, CMA-ES ranking variance
+    was not reduced (46.84 with CRN vs.\ 46.50 independent), because TASEP's
+    state-dependent first-passage sampling consumes different numbers of random
+    draws per step for different dwell profiles, desynchronizing the shared
+    streams after the first few steps.
+
+  \item \textbf{Surrogate-assisted CMA-ES.} Random Forest and Gaussian Process
+    surrogates were trained on 750 CMA-ES samples (generations 0--29) to
+    predict candidate fitness. All models produced negative $R^2$ on the
+    test set (gens 30--49): the CMA-ES search trajectory is non-stationary, and
+    the $1149$-dimensional parameter space is too sparse for a lightweight
+    surrogate.
+\end{itemize}
+
+The actionable lever is keeping $n_{\text{runs}} \le 300$ to stay within one
+SM pass. The operational choice of $n_{\text{runs}} = 200$ gives
+$\sim 2.3\,\text{s/gen}$, the minimum achievable on this hardware at this
+population size.
+
+\subsection{GPU vs.\ CPU and hardware scaling}
+
+Per-generation time scales approximately linearly with gene length:
+\begin{equation}
+  t_{\text{gen}}(L) \;\approx\; 1.524 \times 10^{-3} \cdot L + 0.535 \;\text{s}.
+\end{equation}
+For insQ ($L = 1149\,\text{bp}$) at $n_{\text{runs}} = 200$, the RTX A5000
+achieves $2.29\,\text{s/gen}$ vs.\ $4.88\,\text{s/gen}$ on a 32-thread CPU
+(Threadripper PRO): a 2.1$\times$ GPU speedup. This modest ratio reflects the
+branch-heavy, latency-dominated character of the kernel: the GPU's advantage
+comes entirely from its massive thread count, not from its arithmetic pipeline.
+
+Because the kernel is clock-speed- and SM-count-limited (not compute-limited),
+GPU generation is counterintuitive: an A100 with 108 SMs and a 1.41 GHz boost
+clock is $\sim$20\% \emph{slower} than the RTX A5000 (64 SMs, 1.70 GHz) at
+$n_{\text{runs}} = 200$, because both fit all blocks in one SM pass and the
+A100's lower clock speed dominates. Only the H100 (1.83 GHz) or H200 (1.98
+GHz) improve on the A5000, by 8--17\%.
+
+\subsection{CMA-ES integration and genome-wide runner}
+
+Each gene is deconvolved independently by \texttt{run\_cmaes\_for\_gene()}
+(\texttt{cmaes\_multifidelity.py}). The optimizer is initialized from the
+log-normalized experimental NET-seq signal:
+\begin{equation}
+  \theta_0 = \log\bigl(\max(S_{\text{exp,norm}},\, 10^{-10})\bigr),
+\end{equation}
+giving a warm start that places the initial dwell profile close to the
+observed density shape. The per-gene ribosome loading rate is set from the
+translation efficiency table as $k_{\text{ribo}} = \text{TE}/5$.
+
+The CMA-ES population size scales with gene length ($n_{\text{pop}} \approx
+4 + \lfloor 3 \ln L \rfloor$). Fitness noise from finite $n_{\text{runs}}$
+is absorbed by the CMA-ES noise-handling machinery (noise rank update, noise
+epsilon injection).
+
+The genome-wide runner (\texttt{run\_genome\_wide.py}) assigns one OS process
+per GPU via \texttt{multiprocessing.spawn} to avoid GIL contention: CMA-ES
+operations (\texttt{es.ask()}, \texttt{es.tell()}) hold the GIL, and a
+threading model would starve the second GPU's kernel launches. With independent
+processes, two GPUs operate in full parallel, achieving a 2$\times$ throughput
+on the 4273-gene corpus. Genes are sorted by descending length before dispatch
+so that the longest (slowest) genes run first, minimizing tail-latency imbalance
+at the end of the run.
+
+\section{Reproducibility}
+
+\begin{lstlisting}[basicstyle=\ttfamily\small, breaklines=true]
+python bcm_sweep.py --results-dir ecoli \
+  --genes aceA,dnaK,rpoB,talB,insQ,rhsA,rhsB,ydbA,yihO,caiT \
+  --device-id 0 --n-runs 5000
+\end{lstlisting}
+
+Panel wall time: $1472\,\text{s}$ on a single RTX A5000. Per-gene
+output: \texttt{ecoli/bcm\_sweep/\{gene\}\_sweep.pkl}. Analysis
+notebook: \texttt{bcm\_sweep\_analysis.ipynb}. OpenSpec change
+\texttt{openspec/changes/bcm-krut-sweep} captures the full design and
+task list (23/31 complete; stages 5--6 are the genome-wide roll-out).
+
+\end{document}

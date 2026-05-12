@@ -592,7 +592,10 @@ def _tasep_core(
                 if rnap_ribo_coupling[idx] == 1 and ribo_loc <= gene_length - rnap_width:
                     for pos in range(ribo_loc, gene_length - rnap_width + 1):
                         ribo_exit_matrix[idx, pos] = rnap_exit_matrix[idx, pos + rnap_width]
-                    ribo_locs[idx] = rnap_locs[idx] - rnap_width
+                    new_ribo = rnap_locs[idx] - rnap_width
+                    if new_ribo < 1:
+                        new_ribo = 1
+                    ribo_locs[idx] = new_ribo
 
                 # ── State 2: Coupled, near gene end ──────────────────────────
                 # `geneLength - 30` threshold matches MATLAB's `geneLength - Ribo_width`.
@@ -676,7 +679,10 @@ def _tasep_core(
                         if allowed_advance > 0:
                             for k in range(allowed_advance):
                                 ribo_exit_matrix[idx, ribo_loc + k] = ribo_exit_buffer[k]
-                            ribo_locs[idx] = rnap_locs[idx] - rnap_width
+                            new_ribo = rnap_locs[idx] - rnap_width
+                            if new_ribo < 1:
+                                new_ribo = 1
+                            ribo_locs[idx] = new_ribo
                     elif ribo_advance > 0:
                         # No collision: advance freely.
                         for k in range(ribo_advance):

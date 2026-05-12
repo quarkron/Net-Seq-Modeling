@@ -215,3 +215,10 @@ python postprocess_flux.py --results-dir results --force
 | `--force` | off | Re-process already-completed genes |
 
 **CPU vs GPU performance**: CPU mode parallelizes 200 simulation runs across threads per gene with no batching constraints. GPU mode batches genes sharing the same `gene_length` into a single kernel launch to improve occupancy. On machines with many CPU cores, CPU mode can match or outperform GPU mode since the GPU kernel underutilizes SMs when batch sizes are small.
+
+## Notebooks
+
+- `mathmodel-netseq.ipynb` — analytic flux models (M3 Gaussian shield → M9 plateau form → M13 per-RNAP closed form → M15 snap-aware refinement) fit against the panel-1 prior-benchmark genes and the panel-2 rho-dependent genes
+- `bcm_sweep_analysis.ipynb` — per-gene K_rut sweep panels and rho-dependence map across the 10-gene validation panel
+- `ribo_bias.ipynb` — diagnostic for the ribosome-snap kernel artifact (now patched). Re-runs the panel-1 flux with the fixed kernel and the original CMA-ES `D*` to quantify the bias the artifact pushed into pause-peak amplitudes. See `kinetic_estimates_Linfty_xc.md` §9 and `bcm_sweep_observations.tex` *Known kernel artifact* for context.
+- `ecoli_results_viewer.ipynb` — generic CMA-ES result browser (per-gene D* + flux + S_exp overlay)

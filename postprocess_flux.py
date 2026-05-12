@@ -249,11 +249,15 @@ def main():
                         help="Comma-separated gene names to process (default: all)")
     parser.add_argument("--force", action="store_true",
                         help="Force re-processing of already-completed genes")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Override flux output directory (default: <results-dir>/flux). "
+                             "Use e.g. <results-dir>/flux_patched to write a parallel set of "
+                             "outputs without overwriting the existing flux pickles.")
     args = parser.parse_args()
 
     results_dir = Path(args.results_dir)
     cmaes_dir = results_dir / "cmaes"
-    flux_dir = results_dir / "flux"
+    flux_dir = Path(args.output_dir) if args.output_dir else results_dir / "flux"
     flux_dir.mkdir(parents=True, exist_ok=True)
 
     if not cmaes_dir.exists():

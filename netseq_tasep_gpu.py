@@ -134,7 +134,7 @@ if _CUDA_AVAILABLE:
         # Scalar physical params (shared by all threads)
         k_loading,        # float32
         k_ribo_loading_arr,  # (n_candidates,) float32 — per-candidate
-        pt_percent,       # float32
+        pt_percent_arr,   # (n_candidates,) float32 — per-candidate
         simtime,          # int32
         glutime,          # float32
         # Constants
@@ -310,7 +310,7 @@ if _CUDA_AVAILABLE:
                 if rnap_locs[idx] < gene_length:
                     ptrna_size = rnap_locs[idx] - rnap_width - 30 - ribo_locs[idx]
                     if ptrna_size > min_rho_load_rna:
-                        threshold = pt_percent * ptrna_size / gene_length
+                        threshold = pt_percent_arr[candidate_idx] * ptrna_size / gene_length
                         r = xoroshiro128p_uniform_float32(rng_states, tid)
                         if 100.0 * dt * r <= threshold:
                             temp_rho_loc = rnap_locs[idx] - rnap_width - int(
@@ -346,7 +346,10 @@ if _CUDA_AVAILABLE:
                     # State 1: Coupled, mid-gene
                     if rnap_ribo_coupling[idx] == 1 and ribo_loc <= gene_length - rnap_width:
                         if rnap_loc <= gene_length:
-                            ribo_locs[idx] = rnap_loc - rnap_width
+                            new_ribo = rnap_loc - rnap_width
+                            if new_ribo < 1:
+                                new_ribo = 1
+                            ribo_locs[idx] = new_ribo
 
                     # State 2: Coupled, near gene end
                     elif rnap_ribo_coupling[idx] == 1 and ribo_loc > gene_length - 30:
@@ -379,9 +382,13 @@ if _CUDA_AVAILABLE:
                             allowed = ribo_advance - overlap
                             if allowed > 0:
                                 ribo_locs[idx] = ribo_loc + allowed
-                            # Snap to just behind RNAP
+                            # Snap to just behind RNAP (clamp to >= 1 so subsequent
+                            # State 1 maintenance can fire — see ribo-snap-bias-diagnostic).
                             if rnap_loc <= gene_length:
-                                ribo_locs[idx] = rnap_loc - rnap_width
+                                new_ribo = rnap_loc - rnap_width
+                                if new_ribo < 1:
+                                    new_ribo = 1
+                                ribo_locs[idx] = new_ribo
                         elif ribo_advance > 0:
                             ribo_locs[idx] = ribo_loc + ribo_advance
 
@@ -480,12 +487,15 @@ if _CUDA_AVAILABLE:
 # Host-side helpers
 # ---------------------------------------------------------------------------
 
-def _prepare_kernel_inputs(thetas, base_params, n_runs, k_ribo_loadings=None):
+def _prepare_kernel_inputs(thetas, base_params, n_runs, k_ribo_loadings=None,
+                           k_rut_loadings=None):
     """Build deduplicated arrays and scalar params for the GPU kernel.
 
     Args:
         k_ribo_loadings: optional per-candidate array of kRiboLoading values.
             If None, broadcasts base_params["kRiboLoading"] to all candidates.
+        k_rut_loadings: optional per-candidate array of KRutLoading values.
+            If None, broadcasts base_params["KRutLoading"] to all candidates.
     """
     from netseq_tasep_fast import _estimate_caps
 
@@ -498,13 +508,18 @@ def _prepare_kernel_inputs(thetas, base_params, n_runs, k_ribo_loadings=None):
     rnap_speed = float(base_params.get("RNAPSpeed", 19))
     ribo_speed = float(base_params.get("ribospeed", 19))
     k_loading = float(base_params.get("kLoading", 1 / 20))
-    pt_percent = float(base_params.get("KRutLoading", 0.13))
 
     # Per-candidate k_ribo_loading array
     if k_ribo_loadings is not None:
         k_ribo_arr = np.asarray(k_ribo_loadings, dtype=np.float32)
     else:
         k_ribo_arr = np.full(n_candidates, base_params.get("kRiboLoading", 0), dtype=np.float32)
+
+    # Per-candidate K_rut array
+    if k_rut_loadings is not None:
+        k_rut_arr = np.asarray(k_rut_loadings, dtype=np.float32)
+    else:
+        k_rut_arr = np.full(n_candidates, float(base_params.get("KRutLoading", 0.13)), dtype=np.float32)
     simtime = int(base_params.get("simtime", 2000))
     glutime = float(base_params.get("glutime", 1600))
     dx = 1.0
@@ -543,7 +558,7 @@ def _prepare_kernel_inputs(thetas, base_params, n_runs, k_ribo_loadings=None):
         # Scalar params (typed for kernel)
         "k_loading": np.float32(k_loading),
         "k_ribo_loading_arr": k_ribo_arr,
-        "pt_percent": np.float32(pt_percent),
+        "pt_percent_arr": k_rut_arr,
         "simtime": np.int32(simtime),
         "glutime": np.float32(glutime),
         "rnap_width": np.int32(rnap_width),
@@ -563,6 +578,7 @@ def _launch_tasep_kernel(inputs, rng_states, d_dwell, d_ribo_dwell, d_rho_dwell,
     blocks = (n_total + threads_per_block - 1) // threads_per_block
 
     d_k_ribo = cuda.to_device(inputs["k_ribo_loading_arr"], stream=stream)
+    d_pt_percent = cuda.to_device(inputs["pt_percent_arr"], stream=stream)
 
     kernel_args = (
         rng_states,
@@ -570,7 +586,7 @@ def _launch_tasep_kernel(inputs, rng_states, d_dwell, d_ribo_dwell, d_rho_dwell,
         d_netseq, d_flux,
         np.int32(inputs["n_runs"]), np.int32(inputs["gene_length"]),
         np.int32(compute_flux),
-        inputs["k_loading"], d_k_ribo, inputs["pt_percent"],
+        inputs["k_loading"], d_k_ribo, d_pt_percent,
         inputs["simtime"], inputs["glutime"],
         inputs["rnap_width"], inputs["dt"], inputs["min_rho_load_rna"],
         inputs["bases_rnap"], inputs["bases_ribo"], inputs["rho_window"],
@@ -675,7 +691,8 @@ def objective_batch_gpu(thetas, base_params, n_runs, S_exp_norm,
 # ---------------------------------------------------------------------------
 
 def simulate_with_flux_gpu(thetas, base_params, n_runs, base_seed=0,
-                           device_id=0, stream=None, k_ribo_loadings=None):
+                           device_id=0, stream=None, k_ribo_loadings=None,
+                           k_rut_loadings=None):
     """
     Run simulation with flux computation enabled.
 
@@ -685,6 +702,8 @@ def simulate_with_flux_gpu(thetas, base_params, n_runs, base_seed=0,
     Args:
         k_ribo_loadings: optional per-candidate kRiboLoading array for
             batching genes with different ribosome loading rates.
+        k_rut_loadings: optional per-candidate KRutLoading (rho loading rate)
+            array for sweeping K_rut within a single batched launch.
 
     Returns:
         (h_netseq, h_flux) — both (n_candidates, gene_length) arrays
@@ -695,7 +714,8 @@ def simulate_with_flux_gpu(thetas, base_params, n_runs, base_seed=0,
         raise RuntimeError("CUDA not available")
 
     inputs = _prepare_kernel_inputs(thetas, base_params, n_runs,
-                                    k_ribo_loadings=k_ribo_loadings)
+                                    k_ribo_loadings=k_ribo_loadings,
+                                    k_rut_loadings=k_rut_loadings)
     n_total = inputs["n_total"]
     gene_length = inputs["gene_length"]
     n_candidates = inputs["n_candidates"]
